@@ -1,0 +1,503 @@
+#include "Session.h"
+
+namespace ghostcut
+{
+
+namespace ids
+{
+    static const juce::Identifier source { "SOURCE" }, fragmentsNode { "FRAGMENTS" }, frag { "F" };
+    static const juce::Identifier path { "path" }, name { "name" }, size { "size" }, hash { "hash" };
+    static const juce::Identifier trimStart { "trimStart" }, trimEnd { "trimEnd" }, sampleRate { "sampleRate" }, numSamples { "numSamples" };
+    static const juce::Identifier uid { "uid" }, start { "start" }, end { "end" }, manual { "manual" };
+    static const juce::Identifier detected { "detected" }, rootOverride { "root" };
+    static const juce::Identifier f0 { "f0" }, voiced { "voiced" }, stab { "stab" }, meanDb { "meanDb" }, peakDb { "peakDb" }, cent { "cent" };
+    static const juce::Identifier selected { "selected" }, selStart { "selStart" }, selEnd { "selEnd" }, loop { "loop" };
+    static const juce::Identifier sensitivity { "sensitivity" }, exportBits { "exportBits" }, version { "version" };
+}
+
+Session::Session (SamplerEngine& e) : engine (e)
+{
+    updateStateCache();
+}
+
+Session::~Session()
+{
+    alive->store (false);
+    generation.fetch_add (1);                 // makes running jobs bail out
+    worker.removeAllJobs (true, 10000);
+}
+
+//==============================================================================
+template <typename Fn>
+void Session::runJob (const juce::String& name, Fn&& fn)
+{
+    worker.addJob ([fn = std::forward<Fn> (fn)]() mutable { fn(); });
+    juce::ignoreUnused (name);
+}
+
+void Session::setStatus (const juce::String& s, bool error)
+{
+    status = s;
+    statusIsError = error;
+    sendChangeMessage();
+}
+
+//==============================================================================
+void Session::importFile (const juce::File& f)
+{
+    missingSource = juce::File();
+    startLoad (f, 0, -1, true, {}, {});
+}
+
+void Session::relocateMissingSource (const juce::File& f)
+{
+    auto keep = fragments;
+    const auto s = missingTrimStart, e = missingTrimEnd;
+    const auto h = missingHash;
+    missingSource = juce::File();
+    startLoad (f, s, e, false, std::move (keep), h);
+}
+
+void Session::startLoad (const juce::File& f, int64_t trimStart, int64_t trimEnd, bool autoAnalyze,
+                         std::vector<Fragment> keepFragments, const juce::String& expectedHash)
+{
+    if (! importer.canImport (f))
+    {
+        setStatus ("Can't import " + f.getFileName() + " (WAV, MP3, AIFF or FLAC only)", true);
+        return;
+    }
+
+    const int gen = generation.fetch_add (1) + 1;
+    busy = true;
+    progress = 0.0f;
+    engine.sendCommand ({ EngineCommand::Type::StopAll });
+    setStatus ("Loading " + f.getFileName() + "...");
+
+    auto aliveFlag = alive;
+    runJob ("load", [this, aliveFlag, gen, f, trimStart, trimEnd, autoAnalyze,
+                     keep = std::move (keepFragments), expectedHash]() mutable
+    {
+        auto keepGoing = [this, aliveFlag, gen] { return aliveFlag->load() && generation.load() == gen; };
+        auto result = importer.load (f, trimStart, trimEnd, [this] (float p) { progress = p; }, keepGoing);
+
+        juce::MessageManager::callAsync ([this, aliveFlag, gen, result, autoAnalyze, keep = std::move (keep), expectedHash]() mutable
+        {
+            if (! aliveFlag->load() || generation.load() != gen) return;
+            busy = false;
+
+            if (result.snapshot == nullptr)
+            {
+                setStatus (result.error, true);
+                return;
+            }
+
+            snapshot = result.snapshot;
+            frames.reset();
+            engine.publishSource (snapshot);
+
+            const auto n = snapshot->numSamples();
+            if (autoAnalyze)
+            {
+                fragments.clear();
+                selectedIndex = -1;
+                selStart = selEnd = 0;
+            }
+            else
+            {
+                // restored project: keep fragments, clamp them to the audio we actually have
+                fragments = std::move (keep);
+                for (auto& fr : fragments) { fr.start = juce::jlimit<int64_t> (0, n, fr.start); fr.end = juce::jlimit<int64_t> (fr.start, n, fr.end); }
+                fragments.erase (std::remove_if (fragments.begin(), fragments.end(), [] (const Fragment& fr) { return fr.length() < 16; }), fragments.end());
+                for (auto& fr : fragments) uidCounter = std::max (uidCounter, fr.uid);
+                selectedIndex = juce::jlimit (-1, (int) fragments.size() - 1, selectedIndex);
+            }
+            publishTable();
+            updateStateCache();
+
+            juce::String msg = snapshot->displayName + " loaded";
+            const bool changed = expectedHash.isNotEmpty() && expectedHash != snapshot->contentHash;
+            if (changed) msg = snapshot->displayName + " loaded, but the file differs from the one saved in this project. Fragment positions may be off.";
+            setStatus (msg, changed);
+
+            startFrameAnalysis (autoAnalyze);
+        });
+    });
+}
+
+void Session::analyze()
+{
+    if (snapshot == nullptr) { setStatus ("Import audio first", true); return; }
+    if (frames != nullptr)
+    {
+        // frames are cached: re-segmenting is instant and needs no worker
+        PhraseSegmenter::Settings s;
+        s.sensitivity = sensitivity;
+        auto found = PhraseSegmenter::segment (*snapshot, *frames, s);
+        std::vector<Fragment> manual;
+        for (auto& f : fragments) if (f.manual) manual.push_back (f);
+        fragments = std::move (found);
+        for (auto& f : fragments) f.uid = nextUid();
+        for (auto& f : manual) fragments.push_back (f);
+        selectedIndex = fragments.empty() ? -1 : 0;
+        sortAndPublish (fragments.empty() ? -1 : fragments.front().uid);
+        setStatus (juce::String (fragments.size()) + " fragments found");
+        return;
+    }
+    startFrameAnalysis (true);
+}
+
+void Session::startFrameAnalysis (bool segmentAfter)
+{
+    if (snapshot == nullptr) return;
+    const int gen = generation.load();
+    busy = true;
+    progress = 0.0f;
+    setStatus (segmentAfter ? "Analyzing phrases..." : "Measuring audio...");
+
+    auto snap = snapshot;
+    auto aliveFlag = alive;
+    runJob ("frames", [this, aliveFlag, gen, snap, segmentAfter]
+    {
+        auto keepGoing = [this, aliveFlag, gen] { return aliveFlag->load() && generation.load() == gen; };
+        auto ff = std::make_shared<FrameFeatures> (PhraseSegmenter::computeFrames (*snap, [this] (float p) { progress = p; }, keepGoing));
+
+        juce::MessageManager::callAsync ([this, aliveFlag, gen, ff, segmentAfter]
+        {
+            if (! aliveFlag->load() || generation.load() != gen) return;
+            busy = false;
+            if (ff->numFrames() == 0) { setStatus ("Analysis cancelled", true); return; }
+            frames = ff;
+
+            // fill in features for any fragment that has none yet (e.g. manual, pre-analysis)
+            for (auto& f : fragments)
+                if (f.features.meanDb <= -100.0f) PhraseSegmenter::measure (f, *snapshot, *frames);
+
+            if (segmentAfter) analyze();
+            else { publishTable(); updateStateCache(); setStatus (snapshot->displayName + " ready"); }
+        });
+    });
+}
+
+void Session::trimToSelection()
+{
+    if (snapshot == nullptr || ! hasSelection()) return;
+    auto cropped = AudioImporter::crop (*snapshot, selStart, selEnd);
+    if (cropped == nullptr) { setStatus ("Selection too short to trim", true); return; }
+
+    // shift fragments into the new coordinates; drop those that fall outside
+    const int64_t off = selStart, len = selEnd - selStart;
+    std::vector<Fragment> kept;
+    for (auto f : fragments)
+    {
+        f.start -= off; f.end -= off;
+        f.start = std::max<int64_t> (0, f.start);
+        f.end = std::min<int64_t> (len, f.end);
+        if (f.length() >= 16) kept.push_back (f);
+    }
+    engine.sendCommand ({ EngineCommand::Type::StopAll });
+    generation.fetch_add (1);
+    snapshot = cropped;
+    frames.reset();
+    fragments = std::move (kept);
+    selStart = selEnd = 0;
+    engine.publishSource (snapshot);
+    sortAndPublish (-1);
+    setStatus ("Trimmed to " + juce::String (snapshot->lengthSeconds(), 2) + " s");
+    startFrameAnalysis (false);
+}
+
+//==============================================================================
+void Session::selectFragment (int index)
+{
+    selectedIndex = juce::jlimit (-1, (int) fragments.size() - 1, index);
+    engine.setSelectedFragment (selectedIndex);
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::setFragmentBounds (int index, int64_t start, int64_t end)
+{
+    if (snapshot == nullptr || index < 0 || index >= (int) fragments.size()) return;
+    const int64_t n = snapshot->numSamples();
+    const int64_t minLen = (int64_t) (0.02 * snapshot->sampleRate);
+    auto& f = fragments[(size_t) index];
+    f.start = juce::jlimit<int64_t> (0, n - minLen, start);
+    f.end = juce::jlimit<int64_t> (f.start + minLen, n, end);
+    if (frames != nullptr) PhraseSegmenter::measure (f, *snapshot, *frames);
+    sortAndPublish (f.uid);
+}
+
+void Session::setFragmentRootOverride (int index, int note)
+{
+    if (index < 0 || index >= (int) fragments.size()) return;
+    fragments[(size_t) index].rootOverride = note;
+    publishTable();
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::deleteFragment (int index)
+{
+    if (index < 0 || index >= (int) fragments.size()) return;
+    fragments.erase (fragments.begin() + index);
+    const int64_t keep = fragments.empty() ? -1 : fragments[(size_t) juce::jmin (index, (int) fragments.size() - 1)].uid;
+    sortAndPublish (keep);
+}
+
+void Session::clearFragments()
+{
+    fragments.clear();
+    sortAndPublish (-1);
+}
+
+int Session::addFragmentFromSelection()
+{
+    if (snapshot == nullptr || ! hasSelection()) return -1;
+    Fragment f;
+    f.uid = nextUid();
+    f.manual = true;
+    f.start = selStart;
+    f.end = selEnd;
+    if (frames != nullptr) PhraseSegmenter::measure (f, *snapshot, *frames);
+    fragments.push_back (f);
+    sortAndPublish (f.uid);
+    return selectedIndex;
+}
+
+void Session::auditionFragment (int index)
+{
+    if (index < 0 || index >= (int) fragments.size()) return;
+    EngineCommand c { EngineCommand::Type::AuditionFragment, index };
+    c.loop = loop;
+    engine.sendCommand (c);
+}
+
+void Session::sortAndPublish (int64_t keepSelectedUid)
+{
+    std::sort (fragments.begin(), fragments.end(), [] (const Fragment& a, const Fragment& b) { return a.start < b.start; });
+    selectedIndex = -1;
+    for (int i = 0; i < (int) fragments.size(); ++i)
+        if (fragments[(size_t) i].uid == keepSelectedUid) selectedIndex = i;
+    engine.setSelectedFragment (selectedIndex);
+    publishTable();
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::publishTable()
+{
+    auto t = std::make_shared<FragmentTable>();
+    t->fragments.reserve (fragments.size());
+    for (auto& f : fragments) t->fragments.push_back ({ f.start, f.end, f.effectiveRoot (-1) });
+    engine.publishFragments (std::move (t));
+    engine.setSelectedFragment (selectedIndex);
+}
+
+//==============================================================================
+void Session::setSelection (int64_t s, int64_t e)
+{
+    if (e < s) std::swap (s, e);
+    if (snapshot != nullptr) { s = juce::jlimit<int64_t> (0, snapshot->numSamples(), s); e = juce::jlimit<int64_t> (0, snapshot->numSamples(), e); }
+    selStart = s; selEnd = e;
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::setLooping (bool l) { loop = l; updateStateCache(); sendChangeMessage(); }
+
+void Session::playFrom (int64_t position)
+{
+    if (snapshot == nullptr) return;
+    EngineCommand c { EngineCommand::Type::PlaySource };
+    if (hasSelection() && (loop || (position >= selStart && position < selEnd)))
+    {
+        c.a = (position >= selStart && position < selEnd) ? position : selStart;
+        c.b = selEnd;
+        if (loop) c.a = selStart;
+    }
+    else
+    {
+        c.a = position;
+        c.b = snapshot->numSamples();
+    }
+    c.loop = loop && hasSelection();
+    engine.sendCommand (c);
+}
+
+void Session::togglePlay (int64_t cursor)
+{
+    if (engine.isPreviewPlaying()) stop();
+    else playFrom (cursor);
+}
+
+void Session::stop() { engine.sendCommand ({ EngineCommand::Type::StopAll }); }
+
+//==============================================================================
+juce::String Session::exportFragment (int index, const juce::File& dest) const
+{
+    if (snapshot == nullptr) return "No audio loaded";
+    if (index < 0 || index >= (int) fragments.size()) return "No fragment selected";
+    const auto& f = fragments[(size_t) index];
+    return AudioExporter::writeRegion (*snapshot, f.start, f.end, dest, exportDepth);
+}
+
+juce::File Session::renderFragmentForDrag (int index, juce::String& error) const
+{
+    if (snapshot == nullptr || index < 0 || index >= (int) fragments.size()) { error = "No fragment"; return {}; }
+    const auto& f = fragments[(size_t) index];
+    auto dest = AudioExporter::getDragExportFolder().getChildFile (AudioExporter::makeFragmentFileName (*snapshot, index + 1, f.start));
+    error = AudioExporter::writeRegion (*snapshot, f.start, f.end, dest, exportDepth);
+    return error.isEmpty() ? dest : juce::File();
+}
+
+//==============================================================================
+void Session::updateStateCache()
+{
+    juce::ValueTree t (stateType);
+    t.setProperty (ids::version, 1, nullptr);
+    t.setProperty (ids::sensitivity, sensitivity, nullptr);
+    t.setProperty (ids::exportBits, (int) exportDepth, nullptr);
+    t.setProperty (ids::selected, selectedIndex, nullptr);
+    t.setProperty (ids::selStart, (juce::int64) selStart, nullptr);
+    t.setProperty (ids::selEnd, (juce::int64) selEnd, nullptr);
+    t.setProperty (ids::loop, loop, nullptr);
+
+    juce::ValueTree src (ids::source);
+    if (snapshot != nullptr)
+    {
+        src.setProperty (ids::path, snapshot->file.getFullPathName(), nullptr);
+        src.setProperty (ids::name, snapshot->displayName, nullptr);
+        src.setProperty (ids::size, snapshot->fileSize, nullptr);
+        src.setProperty (ids::hash, snapshot->contentHash, nullptr);
+        src.setProperty (ids::trimStart, (juce::int64) snapshot->trimStart, nullptr);
+        src.setProperty (ids::trimEnd, (juce::int64) snapshot->trimEnd, nullptr);
+        src.setProperty (ids::sampleRate, snapshot->sampleRate, nullptr);
+        src.setProperty (ids::numSamples, (juce::int64) snapshot->numSamples(), nullptr);
+    }
+    else if (missingSource != juce::File())
+    {
+        // keep the reference even though the file isn't here, so saving doesn't lose it
+        src.setProperty (ids::path, missingSource.getFullPathName(), nullptr);
+        src.setProperty (ids::name, missingSource.getFileName(), nullptr);
+        src.setProperty (ids::hash, missingHash, nullptr);
+        src.setProperty (ids::trimStart, (juce::int64) missingTrimStart, nullptr);
+        src.setProperty (ids::trimEnd, (juce::int64) missingTrimEnd, nullptr);
+    }
+    t.appendChild (src, nullptr);
+
+    juce::ValueTree frs (ids::fragmentsNode);
+    for (auto& f : fragments)
+    {
+        juce::ValueTree n (ids::frag);
+        n.setProperty (ids::uid, (juce::int64) f.uid, nullptr);
+        n.setProperty (ids::start, (juce::int64) f.start, nullptr);
+        n.setProperty (ids::end, (juce::int64) f.end, nullptr);
+        n.setProperty (ids::manual, f.manual, nullptr);
+        n.setProperty (ids::detected, f.detectedNote, nullptr);
+        n.setProperty (ids::rootOverride, f.rootOverride, nullptr);
+        n.setProperty (ids::f0, f.features.medianF0Hz, nullptr);
+        n.setProperty (ids::voiced, f.features.voicedRatio, nullptr);
+        n.setProperty (ids::stab, f.features.pitchStabilitySemis, nullptr);
+        n.setProperty (ids::meanDb, f.features.meanDb, nullptr);
+        n.setProperty (ids::peakDb, f.features.peakDb, nullptr);
+        n.setProperty (ids::cent, f.features.centroidHz, nullptr);
+        frs.appendChild (n, nullptr);
+    }
+    t.appendChild (frs, nullptr);
+
+    const juce::ScopedLock sl (cacheLock);
+    stateCache = t;
+}
+
+juce::ValueTree Session::getStateTree() const
+{
+    const juce::ScopedLock sl (cacheLock);
+    return stateCache.createCopy();
+}
+
+void Session::setStateTreeFromAnyThread (const juce::ValueTree& tree)
+{
+    if (! tree.hasType (stateType)) return;
+    auto copy = tree.createCopy();
+    {
+        // a host may call getState right after setState: answer with what it gave us
+        const juce::ScopedLock sl (cacheLock);
+        stateCache = copy;
+    }
+
+    auto aliveFlag = alive;
+    if (juce::MessageManager::getInstanceWithoutCreating() != nullptr
+        && juce::MessageManager::getInstance()->isThisTheMessageThread())
+        restoreOnMessageThread (copy);
+    else
+        juce::MessageManager::callAsync ([this, aliveFlag, copy] { if (aliveFlag->load()) restoreOnMessageThread (copy); });
+}
+
+void Session::restoreOnMessageThread (const juce::ValueTree& t)
+{
+    sensitivity = (float) t.getProperty (ids::sensitivity, 0.5f);
+    const int bits = (int) t.getProperty (ids::exportBits, 24);
+    exportDepth = bits == 16 ? AudioExporter::BitDepth::Int16 : bits == 32 ? AudioExporter::BitDepth::Float32 : AudioExporter::BitDepth::Int24;
+    loop = (bool) t.getProperty (ids::loop, false);
+    selStart = (juce::int64) t.getProperty (ids::selStart, 0);
+    selEnd = (juce::int64) t.getProperty (ids::selEnd, 0);
+
+    std::vector<Fragment> restored;
+    for (auto n : t.getChildWithName (ids::fragmentsNode))
+    {
+        Fragment f;
+        f.uid = (juce::int64) n.getProperty (ids::uid, 0);
+        f.start = (juce::int64) n.getProperty (ids::start, 0);
+        f.end = (juce::int64) n.getProperty (ids::end, 0);
+        f.manual = (bool) n.getProperty (ids::manual, false);
+        f.detectedNote = (int) n.getProperty (ids::detected, -1);
+        f.rootOverride = (int) n.getProperty (ids::rootOverride, -1);
+        f.features.medianF0Hz = (float) n.getProperty (ids::f0, 0.0f);
+        f.features.voicedRatio = (float) n.getProperty (ids::voiced, 0.0f);
+        f.features.pitchStabilitySemis = (float) n.getProperty (ids::stab, 0.0f);
+        f.features.meanDb = (float) n.getProperty (ids::meanDb, -100.0f);
+        f.features.peakDb = (float) n.getProperty (ids::peakDb, -100.0f);
+        f.features.centroidHz = (float) n.getProperty (ids::cent, 0.0f);
+        if (f.uid == 0) f.uid = nextUid();
+        uidCounter = std::max (uidCounter, f.uid);
+        if (f.end > f.start) restored.push_back (f);
+    }
+    selectedIndex = (int) t.getProperty (ids::selected, -1);
+
+    const auto src = t.getChildWithName (ids::source);
+    const juce::String path = src.getProperty (ids::path).toString();
+    const int64_t trimS = (juce::int64) src.getProperty (ids::trimStart, 0);
+    const int64_t trimE = (juce::int64) src.getProperty (ids::trimEnd, -1);
+    const juce::String hash = src.getProperty (ids::hash).toString();
+
+    // drop whatever is loaded now
+    generation.fetch_add (1);
+    snapshot.reset();
+    frames.reset();
+    engine.publishSource (nullptr);
+    fragments = restored;
+    publishTable();
+
+    if (path.isEmpty())
+    {
+        missingSource = juce::File();
+        updateStateCache();
+        setStatus ("Drop a WAV or MP3 to begin");
+        return;
+    }
+
+    const juce::File file (path);
+    if (! file.existsAsFile())
+    {
+        missingSource = file;
+        missingTrimStart = trimS; missingTrimEnd = trimE; missingHash = hash;
+        updateStateCache();
+        setStatus ("Source missing: " + file.getFileName() + " - click LOCATE to find it. Fragments are kept.", true);
+        return;
+    }
+
+    missingSource = juce::File();
+    startLoad (file, trimS, trimE, false, std::move (restored), hash);
+}
+
+} // namespace ghostcut

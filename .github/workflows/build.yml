@@ -1,0 +1,88 @@
+name: Build GHOSTCUT
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Universal)
+            os: macos-14
+            pluginval: pluginval_macOS.zip
+          - name: Windows
+            os: windows-latest
+            pluginval: pluginval_Windows.zip
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache JUCE download
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-8.0.15-${{ runner.os }}
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build plugin + tests
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          T=$(find build -type f \( -name GhostcutTests -o -name GhostcutTests.exe \) | head -1)
+          echo "Running $T"
+          "$T"
+
+      - name: pluginval (strictness 10)
+        shell: bash
+        run: |
+          curl -sSL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/${{ matrix.pluginval }}
+          unzip -q pv.zip -d pv
+          VST3=$(find build -type d -name "GHOSTCUT.vst3" -path "*Release*" | head -1)
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            PV=pv/pluginval.app/Contents/MacOS/pluginval
+          else
+            PV=pv/pluginval.exe
+          fi
+          "$PV" --strictness-level 10 --validate-in-process --timeout-ms 300000 "$VST3"
+
+      - name: auval (macOS AU)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R "build/GHOSTCUT_artefacts/Release/AU/GHOSTCUT.component" ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          auval -v aumu Ghct T7Au
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cp -R build/GHOSTCUT_artefacts/Release/VST3/GHOSTCUT.vst3 dist/
+          cp -R build/GHOSTCUT_artefacts/Release/AU/GHOSTCUT.component dist/
+          cp -R build/GHOSTCUT_artefacts/Release/Standalone/GHOSTCUT.app dist/
+          lipo -info dist/GHOSTCUT.vst3/Contents/MacOS/GHOSTCUT
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -R build/GHOSTCUT_artefacts/Release/VST3/GHOSTCUT.vst3 dist/
+          cp build/GHOSTCUT_artefacts/Release/Standalone/GHOSTCUT.exe dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GHOSTCUT-${{ runner.os }}
+          path: dist
