@@ -13,7 +13,7 @@ jobs:
       matrix:
         include:
           - name: macOS (Universal)
-            os: macos-14
+            os: macos-latest
             pluginval: pluginval_macOS.zip
           - name: Windows
             os: windows-latest
