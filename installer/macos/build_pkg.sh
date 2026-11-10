@@ -75,7 +75,7 @@ XML
 PKG="$OUT/GHOSTCUT-$VERSION-macOS.pkg"
 SIGN_ARGS=()
 [[ -n "${DEVELOPER_ID_INSTALLER:-}" ]] && SIGN_ARGS=(--sign "$DEVELOPER_ID_INSTALLER" --timestamp)
-productbuild --distribution "$WORK/distribution.xml" --package-path "$WORK" --resources "$WORK/res" "${SIGN_ARGS[@]}" "$PKG"
+productbuild --distribution "$WORK/distribution.xml" --package-path "$WORK" --resources "$WORK/res" ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} "$PKG"   # bash 3.2-safe empty array
 
 if [[ -n "${DEVELOPER_ID_INSTALLER:-}" && -n "${NOTARY_PROFILE:-}" ]]; then
   echo "== notarize"
