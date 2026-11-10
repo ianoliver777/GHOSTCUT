@@ -3,8 +3,12 @@ name: Build GHOSTCUT
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write   # needed to attach installers to a GitHub Release on tags
 
 jobs:
   build:
@@ -65,24 +69,49 @@ jobs:
           killall -9 AudioComponentRegistrar || true
           auval -v aumu Ghct T7Au
 
-      - name: Package macOS
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist
-          cp -R build/GHOSTCUT_artefacts/Release/VST3/GHOSTCUT.vst3 dist/
-          cp -R build/GHOSTCUT_artefacts/Release/AU/GHOSTCUT.component dist/
-          cp -R build/GHOSTCUT_artefacts/Release/Standalone/GHOSTCUT.app dist/
-          lipo -info dist/GHOSTCUT.vst3/Contents/MacOS/GHOSTCUT
-
-      - name: Package Windows
-        if: runner.os == 'Windows'
+      - name: Third-party notices
         shell: bash
         run: |
           mkdir -p dist
-          cp -R build/GHOSTCUT_artefacts/Release/VST3/GHOSTCUT.vst3 dist/
-          cp build/GHOSTCUT_artefacts/Release/Standalone/GHOSTCUT.exe dist/
+          python3 scripts/make_notices.py build/_deps/juce-src build/_deps/onnxruntime-src . dist/THIRD_PARTY_NOTICES.txt
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: echo "v=$(grep -m1 -oE 'project\(GHOSTCUT VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')" >> "$GITHUB_OUTPUT"
+
+      - name: macOS installer (.pkg)
+        if: runner.os == 'macOS'
+        env:
+          # optional: set these repository secrets to produce a signed + notarized package (docs/SIGNING.md)
+          DEVELOPER_ID_APP: ${{ secrets.DEVELOPER_ID_APP }}
+          DEVELOPER_ID_INSTALLER: ${{ secrets.DEVELOPER_ID_INSTALLER }}
+          NOTARY_PROFILE: ${{ secrets.NOTARY_PROFILE }}
+        run: |
+          installer/macos/build_pkg.sh build ${{ steps.ver.outputs.v }} dist/THIRD_PARTY_NOTICES.txt dist
+          lipo -info build/GHOSTCUT_artefacts/Release/VST3/GHOSTCUT.vst3/Contents/MacOS/GHOSTCUT
+          (cd build/GHOSTCUT_artefacts/Release && zip -qry ../../../dist/GHOSTCUT-${{ steps.ver.outputs.v }}-macOS-bundles.zip VST3 AU Standalone)
+
+      - name: Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=${{ steps.ver.outputs.v }} /DBuildDir=$PWD\build /DNotices=$PWD\dist\THIRD_PARTY_NOTICES.txt /DOutDir=$PWD\dist installer\windows\GHOSTCUT.iss
+          Compress-Archive -Path build\GHOSTCUT_artefacts\Release\VST3\GHOSTCUT.vst3 -DestinationPath dist\GHOSTCUT-${{ steps.ver.outputs.v }}-Windows-VST3.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: GHOSTCUT-${{ runner.os }}
           path: dist
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.pkg
+            dist/*.exe
+            dist/*.zip
+          draft: true
+          generate_release_notes: true

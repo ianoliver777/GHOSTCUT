@@ -68,6 +68,12 @@ void FdnReverb::process (float* L, float* R, int n, const FxSettings& s) noexcep
     mix.target = juce::jlimit (0.0f, 1.0f, s.revMix);
     width.target = juce::jlimit (0.0f, 1.0f, s.revWidth);
     const float diffG = 0.55f;
+    std::array<int, 4> dLen {}, dRen {};
+    for (int a = 0; a < 4; ++a)
+    {
+        dLen[(size_t) a] = std::max (1, (int) (diffMsL[a] * scale * 0.001 * sr));
+        dRen[(size_t) a] = std::max (1, (int) (diffMsR[a] * scale * 0.001 * sr));
+    }
 
     for (int k = 0; k < n; ++k)
     {
@@ -77,8 +83,7 @@ void FdnReverb::process (float* L, float* R, int n, const FxSettings& s) noexcep
         // input diffusion (allpass chains)
         for (int a = 0; a < 4; ++a)
         {
-            const int dl = (int) (diffMsL[a] * scale * 0.001 * sr), dr = (int) (diffMsR[a] * scale * 0.001 * sr);
-            const float zl = diffL[(size_t) a].readInt (std::max (1, dl)), zr = diffR[(size_t) a].readInt (std::max (1, dr));
+            const float zl = diffL[(size_t) a].readInt (dLen[(size_t) a]), zr = diffR[(size_t) a].readInt (dRen[(size_t) a]);
             const float vl = inL + diffG * zl, vr = inR + diffG * zr;
             diffL[(size_t) a].push (vl); diffR[(size_t) a].push (vr);
             inL = zl - diffG * vl; inR = zr - diffG * vr;

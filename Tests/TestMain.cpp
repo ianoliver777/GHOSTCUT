@@ -1556,6 +1556,50 @@ struct PresetTests : juce::UnitTest
     }
 };
 
+
+//==============================================================================
+// Phase 6: performance budget
+//==============================================================================
+struct PerformanceTests : juce::UnitTest
+{
+    PerformanceTests() : juce::UnitTest ("Performance", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("worst realistic load stays far inside the real-time budget");
+        const double sr = 48000; const int block = 128;
+        SamplerEngine eng; eng.prepare (sr, block);
+        EffectsChain fx; fx.prepare (sr, block);
+        auto src = makeTestSource (48000, 2);
+        auto table = std::make_shared<FragmentTable>();
+        for (int i = 0; i < 3; ++i) table->fragments.push_back ({ (int64_t) (0.5 * 48000), (int64_t) (1.3 * 48000), 57 });
+        eng.publishSource (src); eng.publishFragments (table);
+        eng.publishPattern (SequencerTests::clickPattern ({ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, 0.2f, 3));
+        FxSettings all; all.texOn = all.lofiOn = all.dlyOn = all.revOn = true;
+        all.drive = 0.5f; all.chorus = 0.5f; all.wow = 0.5f; all.flutter = 0.5f; all.noiseDb = -50; all.lofiBits = 10; all.lofiRateHz = 20000;
+        juce::AudioBuffer<float> buf (2, block);
+        SamplerEngine::Params p;
+        const int blocks = (int) (10.0 * sr / block);
+        double ppq = 0;
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        for (int bI = 0; bI < blocks; ++bI)
+        {
+            juce::MidiBuffer midi;
+            if (bI % 40 == 0) for (int n = 0; n < 8; ++n) midi.addEvent (juce::MidiMessage::noteOn (1, 60 + (n % 3), (juce::uint8) 100), n);
+            HostTransport h; h.valid = h.playing = h.hasPpq = true; h.bpm = 140; h.ppq = ppq;
+            eng.process (buf, midi, p, h);
+            fx.process (buf, all, 140);
+            ppq += block * 140.0 / 60.0 / sr;
+        }
+        const double ms = juce::Time::getMillisecondCounterHiRes() - t0;
+        const double load = ms / 10000.0;
+        logMessage ("10 s of audio, " + juce::String (eng.getActiveVoiceCount()) + " voices active at end, all FX on: "
+                    + juce::String (ms, 1) + " ms  ->  " + juce::String (load * 100.0, 2) + "% of one core");
+        expectLessThan (load, 0.25); // generous: CI machines are slow and shared
+    }
+};
+
+static PerformanceTests performanceTests;
+
 static GhostMatchTests ghostMatchTests;
 static PitchCleanupTests pitchCleanupTests;
 static PresetTests presetTests;

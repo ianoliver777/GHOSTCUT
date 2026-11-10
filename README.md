@@ -7,7 +7,7 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 
 ---
 
-## Status: Phase 5 (advanced features)
+## Status: Phase 6 (commercial preparation): v0.9.0 release candidate
 
 | Feature | State |
 |---|---|
@@ -42,9 +42,16 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 | Advanced search: `like #12`, `very airy`, negation, numbers and notes, plus a JSON contract for an optional language-model interpreter (not included, offline keywords stay the default) | ✅ working |
 | **Presets**: 17 factory presets in 6 categories (also exposed as host programs), user presets with categories, save / load / delete / next / prev, recalled with the project | ✅ working |
 | Analysis upgrades: spectral envelope (12 bands), octave-error correction, isolated-frame cleanup, on-disk frame cache (instant re-open) | ✅ working |
+| **Release tooling**: macOS .pkg (VST3 + AU + app, optional Developer ID signing + notarization) and Windows Inno Setup installer built in CI, auto-generated third-party notices, draft GitHub Release on `v*` tags | ✅ working |
+| Docs: [User guide](docs/USER_GUIDE.md) · [Install](docs/INSTALL.md) · [Signing & notarization](docs/SIGNING.md) · [Licensing review](docs/LICENSING_REVIEW.md) · [Release checklist](docs/RELEASE_CHECKLIST.md) | ✅ |
 | Shortcuts: ⌘/Ctrl+1–5 pages, ⌘/Ctrl+G generate, ⌘/Ctrl+Shift+G rebuild, ⌘/Ctrl+P play pattern, Space play, ↑/↓ browse, ⌘/Ctrl+F search | ✅ working |
 
 Tabs for unbuilt phases are visible but clearly marked as not built yet.
+
+### Verified in Phase 6
+- Performance: 10 s at 48 kHz / 128-sample blocks with 48 voices sounding, a pattern running and **every** effect on renders in ~0.33 s, about **3.4% of one CPU core**.
+- Third-party notices are generated from the real license files (all 15 found).
+- Still to do on real hardware (can't be done in CI): Ableton Live 12 sessions on macOS + Windows, and signing with your certificates.
 
 ### Verified in Phase 5
 - GHOST MATCH: self-match 1.00. A same-shaped phrase in another key (0.79) beats an opposite-shaped phrase in the same register (0.71), which beats a short noisy one (0.20). In a session, the matching phrase ranks first, and the reference survives save/restore.
@@ -317,7 +324,7 @@ Planned additions follow the brief: `Analysis/VocalSeparator` (ONNX), `FeatureEx
 - Stealing a voice when all 48 are busy restarts it without a crossfade (rare, may click).
 - Chops are pre-rendered (pitch/stretch/formant) on a worker thread whenever the pattern, the view or the tempo changes (fit-to-gate modes). Edits take effect after a short render, usually well under a second.
 - Re-running ANALYZE gives fragments new ids, so a pattern built on the old ones shows "MISSING" lanes until you regenerate.
-- Binaries are not code-signed or notarized yet (Phase 6).
+- Signing needs your Apple Developer ID + a Windows code-signing certificate (see docs/SIGNING.md). Until then CI builds are unsigned.
 - AU manufacturer code `T7Au` / plugin code `Ghct`. If other TRIPLE SEVEN AUDIO plugins already use a different manufacturer code, align it **before the first public release** (changing it later breaks saved projects).
 
 ---
