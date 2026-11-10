@@ -3,6 +3,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "Audio/SamplerEngine.h"
 #include "Core/Session.h"
+#include "FxParameters.h"
 
 namespace ghostcut::param
 {
@@ -38,7 +39,7 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    double getTailLengthSeconds() const override { return fx != nullptr ? chain.tailSeconds (fx->fx()) : 0.0; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -56,7 +57,7 @@ public:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
 private:
-    void timerCallback() override { engine.collectGarbage(); }
+    void timerCallback() override;
 
     ghostcut::SamplerEngine engine;
     juce::AudioProcessorValueTreeState apvts;
@@ -72,6 +73,8 @@ private:
     std::atomic<float>* pSeqMode = nullptr;
     std::atomic<float>* pTempo = nullptr;
     std::atomic<float>* pPatLevel = nullptr;
+    std::unique_ptr<ghostcut::fxp::Reader> fx;
+    ghostcut::EffectsChain chain;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GhostcutProcessor)
 };

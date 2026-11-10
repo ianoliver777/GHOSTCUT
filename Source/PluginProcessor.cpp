@@ -18,7 +18,17 @@ GhostcutProcessor::GhostcutProcessor()
     pTempo    = apvts.getRawParameterValue (param::tempo);
     pPatLevel = apvts.getRawParameterValue (param::patLevel);
 
-    startTimerHz (10); // frees objects the audio thread has retired
+    fx = std::make_unique<fxp::Reader> (apvts);
+    session.fxProvider = [this] { return fx->fx(); };
+    session.onGenerated = [this] (GenMode m) { if (fx->followMode()) fxp::applyModePreset (apvts, m); };
+
+    startTimerHz (10); // frees retired objects, forwards render-time FX settings
+}
+
+void GhostcutProcessor::timerCallback()
+{
+    engine.collectGarbage();
+    session.setRenderOptions (fx->render()); // re-renders the pattern only when something changed
 }
 
 GhostcutProcessor::~GhostcutProcessor()
@@ -57,12 +67,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout GhostcutProcessor::createLay
     l.add (std::make_unique<AudioParameterFloat> (ParameterID { param::patLevel, 1 }, "Pattern Level",
                                                   NormalisableRange<float> (-36.0f, 6.0f, 0.1f), 0.0f,
                                                   AudioParameterFloatAttributes().withLabel ("dB")));
+    fxp::addParameters (l);
     return l;
 }
 
 void GhostcutProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     engine.prepare (sampleRate, samplesPerBlock);
+    chain.prepare (sampleRate, std::max (64, samplesPerBlock));
 }
 
 void GhostcutProcessor::releaseResources() {}
@@ -88,6 +100,7 @@ void GhostcutProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
     p.seqMode      = pSeqMode->load() > 0.5f ? SamplerEngine::SeqMode::HostSync : SamplerEngine::SeqMode::Off;
     p.fallbackBpm  = pTempo->load();
     p.patternGain  = juce::Decibels::decibelsToGain (pPatLevel->load(), -36.0f);
+    p.keyPitchRatio = fx->pitchRatioForKeys();
 
     HostTransport host;
     if (auto* ph = getPlayHead())
@@ -100,6 +113,7 @@ void GhostcutProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
         }
 
     engine.process (buffer, midi, p, host);
+    chain.process (buffer, fx->fx(), engine.getLastBpm());
 }
 
 juce::AudioProcessorEditor* GhostcutProcessor::createEditor()

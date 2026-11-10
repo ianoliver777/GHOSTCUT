@@ -13,8 +13,10 @@
 #include "Generation/PatternGenerator.h"
 #include "Generation/ChopRenderer.h"
 #include "Generation/PatternExport.h"
+#include "DSP/Effects.h"
 #include <juce_events/juce_events.h>
 #include <juce_dsp/juce_dsp.h>
+#include <set>
 
 using namespace ghostcut;
 
@@ -803,7 +805,7 @@ struct GeneratorTests : juce::UnitTest
                     if (p.active[(size_t) i])
                     {
                         const auto& e = p.events[(size_t) i];
-                        if (getModeProfile (mode).chromaticProb == 0.0f)
+                        if (getModeProfile (mode).chromaticProb <= 0.0f)
                             expect (ScaleQuantizer::inScale (e.note, 9, ScaleQuantizer::Scale::Minor), juce::String (genModeName (mode)) + " note " + juce::String (e.note));
                         expectLessOrEqual (std::abs (e.note - p.slotRoots[(size_t) e.slot]), 14);
                     }
@@ -1116,6 +1118,240 @@ struct GenerationSessionTests : juce::UnitTest
         dir.deleteRecursively();
     }
 };
+
+
+//==============================================================================
+// Phase 4
+//==============================================================================
+struct EffectsTests : juce::UnitTest
+{
+    EffectsTests() : juce::UnitTest ("Effects", "GHOSTCUT") {}
+
+    static juce::AudioBuffer<float> impulse (int n)
+    {
+        juce::AudioBuffer<float> b (2, n);
+        b.clear();
+        b.setSample (0, 0, 1.0f); b.setSample (1, 0, 1.0f);
+        return b;
+    }
+
+    static void runChain (EffectsChain& c, juce::AudioBuffer<float>& b, const FxSettings& fx, double bpm = 120.0)
+    {
+        const int block = 512;
+        for (int pos = 0; pos < b.getNumSamples(); pos += block)
+        {
+            const int n = std::min (block, b.getNumSamples() - pos);
+            juce::AudioBuffer<float> view (b.getArrayOfWritePointers(), 2, pos, n);
+            c.process (view, fx, bpm);
+        }
+    }
+
+    static bool allFinite (const juce::AudioBuffer<float>& b)
+    {
+        for (int c = 0; c < b.getNumChannels(); ++c)
+            for (int i = 0; i < b.getNumSamples(); ++i) if (! std::isfinite (b.getSample (c, i))) return false;
+        return true;
+    }
+
+    void runTest() override
+    {
+        const double sr = 44100;
+
+        beginTest ("everything off = bit-exact passthrough");
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            juce::AudioBuffer<float> b (2, 4096), ref;
+            juce::Random rng (1);
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 4096; ++i) b.setSample (ch, i, rng.nextFloat() - 0.5f);
+            ref = b;
+            runChain (c, b, FxSettings {});
+            float diff = 0;
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < 4096; ++i) diff = std::max (diff, std::abs (b.getSample (ch, i) - ref.getSample (ch, i)));
+            expectEquals (diff, 0.0f);
+        }
+
+        beginTest ("reverb decay matches the RT60 setting, stays stable");
+        for (float t60 : { 1.0f, 3.0f })
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings fx; fx.revOn = true; fx.revMix = 1.0f; fx.revDecay = t60; fx.revPreDelayMs = 0; fx.revDamping = 0.5f;
+            auto b = impulse ((int) (sr * (t60 + 1.5)));
+            // measure in a 500 Hz - 2 kHz band (damping only affects the highs)
+            {
+                dsp::Biquad hp, lp;
+                hp.set (dsp::Biquad::Type::HighPass, sr, 500); lp.set (dsp::Biquad::Type::LowPass, sr, 2000);
+                juce::ignoreUnused (hp, lp);
+            }
+            runChain (c, b, fx);
+            expect (allFinite (b));
+            {
+                dsp::Biquad hp, lp;
+                hp.set (dsp::Biquad::Type::HighPass, sr, 500); lp.set (dsp::Biquad::Type::LowPass, sr, 2000);
+                for (int i = 0; i < b.getNumSamples(); ++i) b.setSample (0, i, lp.process (hp.process (b.getSample (0, i))));
+            }
+            // energy in 50 ms windows; slope of the dB curve between -5 and -35 dB, extrapolated to 60 dB
+            const int w = (int) (0.05 * sr);
+            std::vector<double> db;
+            for (int i = 0; i + w < b.getNumSamples(); i += w)
+            {
+                double e = 0; for (int k = 0; k < w; ++k) e += b.getSample (0, i + k) * b.getSample (0, i + k);
+                db.push_back (10 * std::log10 (e + 1e-30));
+            }
+            const double peak = *std::max_element (db.begin(), db.end());
+            int a = -1, z = -1;
+            for (int i = 0; i < (int) db.size(); ++i) { if (a < 0 && db[(size_t) i] < peak - 5) a = i; if (z < 0 && db[(size_t) i] < peak - 35) z = i; }
+            expect (a > 0 && z > a);
+            const double measured = (z - a) * 0.05 * 60.0 / 30.0;
+            logMessage ("RT60 set " + juce::String (t60) + " s, measured " + juce::String (measured, 2) + " s");
+            expectWithinAbsoluteError ((float) measured, t60, t60 * 0.35f);
+        }
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings fx; fx.revOn = true; fx.revMix = 1.0f; fx.revDecay = 20.0f; fx.revSize = 1.0f; fx.revDamping = 0.0f;
+            juce::AudioBuffer<float> b (2, (int) (sr * 20));
+            juce::Random rng (2);
+            for (int i = 0; i < b.getNumSamples(); ++i) { const float v = rng.nextFloat() - 0.5f; b.setSample (0, i, v); b.setSample (1, i, v); }
+            runChain (c, b, fx);
+            expect (allFinite (b));
+            expectLessThan (b.getMagnitude (0, b.getNumSamples() - 44100, 44100), 20.0f); // no runaway feedback
+        }
+
+        beginTest ("tempo-synced ping-pong delay");
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings fx; fx.dlyOn = true; fx.dlyDivision = 5; fx.dlyMix = 1.0f; fx.dlyFeedback = 0.5f; fx.dlyPingPong = true;
+            fx.dlyLowCut = 20; fx.dlyHighCut = 20000;
+            auto b = impulse ((int) sr);
+            runChain (c, b, fx, 120.0);
+            // 1/8 at 120 bpm = 0.25 s: first echo left, second echo right
+            auto peakNear = [&] (int ch, int at) { float m = 0; int idx = -1; for (int i = at - 300; i < at + 300; ++i) if (std::abs (b.getSample (ch, i)) > m) { m = std::abs (b.getSample (ch, i)); idx = i; } return std::make_pair (idx, m); };
+            const auto e1L = peakNear (0, 11025), e1R = peakNear (1, 11025), e2R = peakNear (1, 22050);
+            expectWithinAbsoluteError (e1L.first, 11025, 4);
+            expectGreaterThan (e1L.second, 0.2f);
+            expectLessThan (e1R.second, 0.05f);
+            expectWithinAbsoluteError (e2R.first, 22050, 6);
+            expectLessThan (e2R.second, e1L.second);
+        }
+
+        beginTest ("lo-fi: bit depth and sample rate reduction");
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings fx; fx.lofiOn = true; fx.lofiBits = 4; fx.lofiRateHz = 4000; fx.lofiMix = 1.0f;
+            juce::AudioBuffer<float> b (2, 8192);
+            for (int i = 0; i < 8192; ++i) { const float v = 0.8f * (float) std::sin (2 * juce::MathConstants<double>::pi * 200 * i / sr); b.setSample (0, i, v); b.setSample (1, i, v); }
+            runChain (c, b, fx);
+            std::set<int> levels;
+            int holds = 0;
+            for (int i = 2048; i < 8192; ++i)
+            {
+                levels.insert ((int) std::lround (b.getSample (0, i) * 1000));
+                if (std::abs (b.getSample (0, i) - b.getSample (0, i - 1)) < 1e-7f) ++holds;
+            }
+            logMessage ("4-bit levels seen: " + juce::String ((int) levels.size()) + ", held samples " + juce::String (holds));
+            expectLessOrEqual ((int) levels.size(), 18);
+            expectGreaterThan (holds, 6144 / 2); // ~10 of every 11 samples repeat at 4 kHz
+        }
+
+        beginTest ("saturation adds harmonics; noise only when asked");
+        {
+            auto thd = [&] (float drive)
+            {
+                EffectsChain c; c.prepare (sr, 512);
+                FxSettings fx; fx.texOn = true; fx.drive = drive;
+                juce::AudioBuffer<float> b (2, 16384);
+                for (int i = 0; i < 16384; ++i) { const float v = 0.7f * (float) std::sin (2 * juce::MathConstants<double>::pi * 441 * i / sr); b.setSample (0, i, v); b.setSample (1, i, v); }
+                runChain (c, b, fx);
+                // energy at 3rd harmonic via a single-bin DFT
+                double re = 0, im = 0, re1 = 0, im1 = 0;
+                for (int i = 4096; i < 16384; ++i)
+                {
+                    const double x = b.getSample (0, i), t = 2 * juce::MathConstants<double>::pi * i / sr;
+                    re += x * std::cos (t * 1323); im += x * std::sin (t * 1323);
+                    re1 += x * std::cos (t * 441); im1 += x * std::sin (t * 441);
+                }
+                return std::sqrt (re * re + im * im) / std::sqrt (re1 * re1 + im1 * im1);
+            };
+            expectGreaterThan (thd (0.8f), thd (0.0f) * 10.0 + 0.01);
+
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings fx; fx.texOn = true; fx.noiseDb = -80;
+            juce::AudioBuffer<float> silent (2, 8192); silent.clear();
+            runChain (c, silent, fx);
+            expectEquals (silent.getMagnitude (0, 8192), 0.0f);
+            fx.noiseDb = -30;
+            runChain (c, silent, fx);
+            expectGreaterThan (silent.getMagnitude (0, 8192), 0.001f);
+        }
+
+        beginTest ("wow makes the pitch drift");
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings fx; fx.texOn = true; fx.wow = 1.0f;
+            auto src = makeVoice (sr, 4.0, 440, 440, 0, 0, 0.0);
+            juce::AudioBuffer<float> b (2, src->audio.getNumSamples());
+            b.copyFrom (0, 0, src->audio, 0, 0, b.getNumSamples()); b.copyFrom (1, 0, src->audio, 0, 0, b.getNumSamples());
+            runChain (c, b, fx);
+            auto snap = std::make_shared<SourceSnapshot>(); snap->sampleRate = sr; snap->audio = b;
+            auto f = measureWhole (*snap);
+            logMessage ("pitch spread with wow: " + juce::String (f.features.pitchStabilitySemis, 3) + " st");
+            expectGreaterThan (f.features.pitchStabilitySemis, 0.03f);
+        }
+
+        beginTest ("toggling sections does not click");
+        {
+            EffectsChain c; c.prepare (sr, 512);
+            FxSettings off, on; on.revOn = true; on.dlyOn = true; on.texOn = true; on.lofiOn = true; on.lofiBits = 8; on.drive = 0.5f;
+            juce::AudioBuffer<float> b (2, 512);
+            float worst = 0, prev = 0;
+            for (int blk = 0; blk < 200; ++blk)
+            {
+                for (int i = 0; i < 512; ++i)
+                {
+                    const float v = 0.3f * (float) std::sin (2 * juce::MathConstants<double>::pi * 110 * (blk * 512 + i) / sr);
+                    b.setSample (0, i, v); b.setSample (1, i, v);
+                }
+                c.process (b, (blk / 25) % 2 ? on : off, 120.0);
+                for (int i = 0; i < 512; ++i) { worst = std::max (worst, std::abs (b.getSample (0, i) - prev)); prev = b.getSample (0, i); }
+            }
+            logMessage ("largest sample step while toggling: " + juce::String (worst, 4));
+            expectLessThan (worst, 0.12f); // a 110 Hz sine at 0.3 moves ~0.005/sample; a click would be ~0.3+
+            expect (allFinite (b));
+        }
+    }
+};
+
+struct RenderOptionsTests : juce::UnitTest
+{
+    RenderOptionsTests() : juce::UnitTest ("RenderOptions", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("global pitch, reverse-all and harmony reach the rendered chops");
+        auto src = makeVoice (44100, 1.0, 220, 220, 0, 0, 0.0);
+        Pattern p;
+        p.slotUids = { 1 }; p.slotRoots = { 57 };
+        p.active[0] = true; p.events[0].note = 57; p.events[0].gateSteps = 4;
+        p.madeWith.key = 9; p.madeWith.scale = ScaleQuantizer::Scale::Minor;
+        const std::vector<std::pair<int64_t, int64_t>> bounds { { 13230, 13230 + 44100 } };
+
+        auto plain = renderPattern (p, *src, bounds, 120.0);
+        RenderOptions o; o.semitones = 5;
+        auto up = renderPattern (p, *src, bounds, 120.0, {}, o);
+        expectWithinAbsoluteError (12.0f * std::log2 (medianPitch (up->clips[0], 44100) / medianPitch (plain->clips[0], 44100)), 5.0f, 0.3f);
+
+        RenderOptions r; r.reverseAll = true; r.reverseFadeMs = 200;
+        auto rev = renderPattern (p, *src, bounds, 120.0, {}, r);
+        // reversed chop swells in: its first 100 ms are much quieter than the plain chop's
+        expectLessThan (rev->clips[0].getRMSLevel (0, 0, 4410), plain->clips[0].getRMSLevel (0, 0, 4410) * 0.6f);
+
+        RenderOptions h; h.harmony = 4; // 3rd + 5th
+        auto harm = renderPattern (p, *src, bounds, 120.0, {}, h);
+        expectEquals ((int) harm->hits[0].size(), 3);
+        expect (h != RenderOptions {});
+    }
+};
+
+static EffectsTests effectsTests;
+static RenderOptionsTests renderOptionsTests;
 
 static GeneratorTests generatorTests;
 static ChopRendererTests chopRendererTests;

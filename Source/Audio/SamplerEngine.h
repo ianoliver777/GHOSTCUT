@@ -53,6 +53,7 @@ public:
         SeqMode seqMode = SeqMode::HostSync;
         double fallbackBpm = 120.0;   // when the host gives no tempo
         float patternGain = 1.0f;
+        float keyPitchRatio = 1.0f;   // EFFECTS > PITCH for keyboard-played chops
     };
 
     static constexpr int maxVoices = 48;

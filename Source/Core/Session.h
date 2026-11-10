@@ -7,6 +7,7 @@
 #include "../Analysis/SearchQuery.h"
 #include "../Generation/PatternGenerator.h"
 #include "../Generation/PatternExport.h"
+#include "../DSP/Effects.h"
 #include "../Audio/AudioImporter.h"
 #include "../Audio/AudioExporter.h"
 #include "../Audio/SamplerEngine.h"
@@ -113,6 +114,12 @@ public:
     /** Fragment index for a pattern slot (or -1 if that fragment no longer exists). */
     int fragmentIndexForSlot (int slot) const;
 
+    // ---- EFFECTS hooks (set by the processor) ----
+    void setRenderOptions (const RenderOptions& o);       // re-renders the pattern when changed
+    const RenderOptions& getRenderOptions() const noexcept { return renderOptions; }
+    std::function<FxSettings()> fxProvider;               // current FX, used for loop exports
+    std::function<void (GenMode)> onGenerated;            // e.g. apply the mode's FX preset
+
     // ---- waveform selection / transport ----
     int64_t getSelectionStart() const noexcept { return selStart; }
     int64_t getSelectionEnd() const noexcept { return selEnd; }
@@ -179,6 +186,7 @@ private:
     std::vector<int64_t> pinned;
     std::shared_ptr<const RenderedPattern> rendered;
     double renderedBpm = 0.0;
+    RenderOptions renderOptions;
     bool renderingPattern = false;
     std::atomic<int> patternGeneration { 0 };
     std::shared_ptr<const FrameFeatures> frames;

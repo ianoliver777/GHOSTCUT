@@ -123,7 +123,10 @@ set(GHOSTCUT_CORE_SOURCES
     Source/Generation/ChopRenderer.h
     Source/Generation/ChopRenderer.cpp
     Source/Generation/PatternExport.h
-    Source/Generation/PatternExport.cpp)
+    Source/Generation/PatternExport.cpp
+    Source/DSP/Biquad.h
+    Source/DSP/Effects.h
+    Source/DSP/Effects.cpp)
 
 set(GHOSTCUT_UI_SOURCES
     Source/UI/GhostLookAndFeel.h
@@ -139,7 +142,9 @@ set(GHOSTCUT_UI_SOURCES
     Source/UI/GeneratePanel.h
     Source/UI/GeneratePanel.cpp
     Source/UI/SequencePanel.h
-    Source/UI/SequencePanel.cpp)
+    Source/UI/SequencePanel.cpp
+    Source/UI/EffectsPanel.h
+    Source/UI/EffectsPanel.cpp)
 
 set(GHOSTCUT_COMMON_DEFINITIONS
     JUCE_WEB_BROWSER=0
@@ -179,6 +184,8 @@ target_sources(GHOSTCUT PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.h
     Source/PluginEditor.cpp
+    Source/FxParameters.h
+    Source/FxParameters.cpp
     ${GHOSTCUT_CORE_SOURCES}
     ${GHOSTCUT_UI_SOURCES})
 

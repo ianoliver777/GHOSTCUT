@@ -146,7 +146,7 @@ void SettingsPanel::paint (juce::Graphics& g)
     }, colours::textDim);
 
     heading (aboutArea, "ABOUT");
-    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 3 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
+    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 4 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
 }
 
 void SettingsPanel::resized()
@@ -176,8 +176,7 @@ GhostcutEditor::GhostcutEditor (GhostcutProcessor& p)
       discover (p.getSession(), p.getEngine(), p.getParameters()),
       generate (p.getSession(), p.getEngine(), p.getParameters()),
       sequence (p.getSession(), p.getEngine()),
-      effects ("EFFECTS", "PHASE 4", { "Reverb, delay, pitch / formant, texture, reverse, lo-fi",
-                                       "Integrated with playback and export" }),
+      effects (p.getSession(), p.getParameters()),
       settings (p.getSession())
 {
     setLookAndFeel (&lnf);

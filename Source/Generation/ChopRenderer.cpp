@@ -97,9 +97,15 @@ juce::AudioBuffer<float> ChopRenderer::render (const SourceSnapshot& src, const 
     return out;
 }
 
+juce::StringArray RenderOptions::harmonyNames()
+{
+    return { "Off", "+ 3rd", "+ 5th", "+ octave", "+ 3rd + 5th", "+ octave + 5th", "- octave" };
+}
+
 std::shared_ptr<RenderedPattern> renderPattern (const Pattern& p, const SourceSnapshot& src,
                                                 const std::vector<std::pair<int64_t, int64_t>>& slotBounds,
-                                                double bpm, const std::function<bool()>& keepGoing)
+                                                double bpm, const std::function<bool()>& keepGoing,
+                                                const RenderOptions& opt)
 {
     auto rp = std::make_shared<RenderedPattern>();
     rp->pattern = p;
@@ -135,17 +141,39 @@ std::shared_ptr<RenderedPattern> renderPattern (const Pattern& p, const SourceSn
         ChopRenderer::Request rq;
         rq.start = s; rq.end = en;
         rq.startFrac = e.startFrac; rq.endFrac = e.endFrac;
-        rq.reverse = e.reverse;
-        rq.semitones = (float) (e.note - root);
+        rq.reverse = e.reverse != opt.reverseAll;           // "reverse all" flips every chop
+        rq.semitones = (float) (e.note - root) + opt.semitones + opt.fineCents / 100.0f;
         rq.stretch = e.stretch;
         if (e.fitToGate) rq.fixedOutputLength = (int64_t) std::lround (e.gateSteps / std::max (1, e.ratchet) * stepSec * src.sampleRate);
-        rq.formantSemis = e.formantSemis;
+        rq.formantSemis = e.formantSemis + opt.formantSemis;
         rq.fadeInMs = e.fadeInMs;
         rq.fadeOutMs = e.fadeOutMs;
+        if (rq.reverse)
+        {
+            // a reversed chop swells in: its "transition" is the fade into the reversed attack
+            rq.fadeInMs = std::max (rq.fadeInMs, opt.reverseFadeMs);
+            rq.fadeOutMs = std::max (4.0f, std::min (rq.fadeOutMs, opt.reverseFadeMs * 0.25f));
+        }
 
         const int main = clipFor (rq);
         if (main >= 0) rp->hits[(size_t) i].push_back ({ main, 1.0f });
-        for (auto& l : e.layers)
+        // global harmony layers (in the pattern's key)
+        std::vector<Layer> layers = e.layers;
+        {
+            const auto& g = p.madeWith;
+            auto inKey = [&] (int semis) { return ScaleQuantizer::quantize (e.note + semis, g.key, g.scale) - e.note; };
+            switch (opt.harmony)
+            {
+                case 1: layers.push_back ({ inKey (4), 0.4f, 5.0f }); break;
+                case 2: layers.push_back ({ 7, 0.4f, 4.0f }); break;
+                case 3: layers.push_back ({ 12, 0.35f, 6.0f }); break;
+                case 4: layers.push_back ({ inKey (4), 0.35f, 5.0f }); layers.push_back ({ 7, 0.35f, -4.0f }); break;
+                case 5: layers.push_back ({ 12, 0.3f, 6.0f }); layers.push_back ({ 7, 0.35f, -4.0f }); break;
+                case 6: layers.push_back ({ -12, 0.45f, 8.0f }); break;
+                default: break;
+            }
+        }
+        for (auto& l : layers)
         {
             auto lr = rq;
             lr.semitones = rq.semitones + (float) l.semitones + l.detuneCents / 100.0f;

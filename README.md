@@ -7,7 +7,7 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 
 ---
 
-## Status: Phase 3 (generation engine)
+## Status: Phase 4 (creative DSP)
 
 | Feature | State |
 |---|---|
@@ -34,10 +34,21 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 | Host tempo + transport sync (sample-accurate), swing, internal play for preview | ✅ working |
 | Pattern bank A–H saved in the project | ✅ working |
 | Export loop WAV (seamless, tail wrapped) and MIDI. Drag either straight into Live | ✅ working |
-| EFFECTS | ⏳ Phase 4 |
+| **EFFECTS**: TEXTURE (saturation, tilt, low/high cut, chorus, wow, flutter, noise), LO-FI (rate, bits, bandwidth, drive, mix), DELAY (tempo-synced, ping-pong, filtered feedback), REVERB (8-line FDN: size, decay, pre-delay, damping, width, mix) | ✅ working |
+| PITCH / FORMANT (semitones, fine, formant, harmony layers) and REVERSE (all chops, transition, reverse step order), rendered offline for best quality | ✅ working |
+| Mode FX presets + "FX follow mode". All ~35 effect controls are automatable | ✅ working |
+| Loop exports include the effects (two-pass render, so tails wrap seamlessly) | ✅ working |
 | GHOST MATCH, preset library | ⏳ Phase 5 |
 
 Tabs for unbuilt phases are visible but clearly marked as not built yet.
+
+### Verified in Phase 4
+- All effects off = bit-exact passthrough. Toggling every section on/off mid-signal stays click-free (linear 20 ms fades that land exactly on 0/1).
+- Reverb: the mid-band decay tracks the setting (1 s → 0.9 s, 3 s → 2.4 s measured). It stays stable at 20 s decay with max size and no damping for 20 s of noise.
+- Delay: a 1/8 at 120 bpm echo lands within 4 samples; ping-pong alternates L → R; feedback decays.
+- Lo-fi: 4-bit gives 15 levels, and a 4 kHz rate holds samples. Saturation adds >10× third harmonic. Noise is exactly silent when off. Wow bends pitch ~0.15 st.
+- Global pitch/reverse/harmony reach the rendered chops (+5 st measured within 0.3 st).
+- pluginval strictness 10 passes.
 
 ### Verified in Phase 3
 - Same seed → identical pattern (tested, including after save/restore). Notes stay in key for the in-key modes over 120 seeds.
@@ -158,7 +169,15 @@ What each mode actually does (`Source/Generation/PatternGenerator.cpp`):
 | HEAVEN | very sparse, long holds | slow stepwise | stretched to fill the gate, stacked +12/+7/+4 harmonies (80%), bright formants |
 | CHAOS | dense | big leaps | ratchets ×2–4, random chop starts, ×0.5–1.5 speed, formant ±6 st, 1–4 ms fades |
 
-Phase 4 adds a matching effects chain per mode.
+Each mode also has a matching effects preset (EFFECTS → mode FX, or automatic with "FX follow the GENERATE mode"):
+
+| Mode | FX |
+|---|---|
+| ETHEREAL | big bright reverb (6.5 s), dotted-1/8 ping-pong, chorus, high-pass |
+| HAUNTED | huge dark reverb (9 s, heavy damping, 80 ms pre-delay), dotted-1/4 filtered delay, tilt dark, wow, faint hiss |
+| NOSTALGIA | saturation, wow + flutter, hiss/crackle, 26 kHz / 12-bit lo-fi, short warm room |
+| HEAVEN | 14 s bright reverb, 1/4 ping-pong, chorus, tilt bright |
+| CHAOS | 1/16T delay at 70% feedback, 9 kHz / 7-bit crush, saturation, flutter |
 
 ## Search: what it understands
 
@@ -204,7 +223,9 @@ Source/
                SearchQuery, VocalSeparator (MDX + center extract + cache), OnnxRuntime (dynamic loader), Stft
   Generation/  Random (PCG32), ScaleQuantizer, Pattern, PatternGenerator (+ mode profiles), ChopRenderer
                (Signalsmith), PatternExport (loop WAV + MIDI)
-  UI/          + PatternView (roll / lanes editor), GeneratePanel, SequencePanel
+  DSP/         Biquad / DelayLine / smoothers, Effects (Texture, LoFi, SyncDelay, FdnReverb, EffectsChain)
+  FxParameters (effect parameters, readers, mode presets)
+  UI/          + PatternView (roll / lanes editor), GeneratePanel, SequencePanel, EffectsPanel
   UI/          GhostLookAndFeel, WaveformView, FragmentBrowser, DiscoverPanel
   PluginProcessor / PluginEditor
 Tests/         GhostcutTests console app

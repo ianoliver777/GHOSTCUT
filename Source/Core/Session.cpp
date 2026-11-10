@@ -722,6 +722,7 @@ void Session::generate (bool newSeed)
     updateStateCache();
     setStatus (juce::String (genModeName (gen.mode)) + " pattern, seed " + juce::String ((int) gen.seed)
                + ", " + juce::String (pattern.numEvents()) + " hits");
+    if (onGenerated) onGenerated (gen.mode);
     renderPatternAsync();
 }
 
@@ -794,10 +795,11 @@ void Session::renderPatternAsync()
     renderingPattern = true;
     auto pat = pattern;
     auto aliveFlag = alive;
-    runJob ("pattern", [this, aliveFlag, pgen, snap, pat, bounds, bpm]
+    const auto opts = renderOptions;
+    runJob ("pattern", [this, aliveFlag, pgen, snap, pat, bounds, bpm, opts]
     {
         auto keepGoing = [this, aliveFlag, pgen] { return aliveFlag->load() && patternGeneration.load() == pgen; };
-        auto rp = renderPattern (pat, *snap, bounds, bpm, keepGoing);
+        auto rp = renderPattern (pat, *snap, bounds, bpm, keepGoing, opts);
         juce::MessageManager::callAsync ([this, aliveFlag, pgen, rp, bpm]
         {
             if (! aliveFlag->load() || patternGeneration.load() != pgen) return;
@@ -830,10 +832,30 @@ static juce::String writeWav (const juce::AudioBuffer<float>& audio, double sr, 
     return AudioExporter::writeRegion (tmp, 0, audio.getNumSamples(), dest, depth);
 }
 
+void Session::setRenderOptions (const RenderOptions& o)
+{
+    if (o == renderOptions) return;
+    renderOptions = o;
+    if (hasPattern()) renderPatternAsync();
+}
+
 juce::String Session::exportLoop (const juce::File& dest, int loops) const
 {
     if (rendered == nullptr) return "Generate a pattern first.";
-    auto audio = PatternExport::renderLoop (*rendered, renderedBpm > 0 ? renderedBpm : getBpm(), loops, true);
+    const double bpm = renderedBpm > 0 ? renderedBpm : getBpm();
+    auto audio = PatternExport::renderLoop (*rendered, bpm, loops, true);
+
+    // processed export: run the loop through the EFFECTS chain. Two passes so reverb and
+    // delay tails from the end of the loop are already present at its start (seamless).
+    if (fxProvider)
+    {
+        const auto fx = fxProvider();
+        EffectsChain chain;
+        chain.prepare (rendered->sampleRate, 2048);
+        juce::AudioBuffer<float> warm (audio);
+        chain.process (warm, fx, bpm);           // pass 1 primes the tails
+        chain.process (audio, fx, bpm);          // pass 2 is what we keep
+    }
     return writeWav (audio, rendered->sampleRate, dest, exportDepth);
 }
 

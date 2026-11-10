@@ -5,6 +5,7 @@
 #include "UI/DiscoverPanel.h"
 #include "UI/GeneratePanel.h"
 #include "UI/SequencePanel.h"
+#include "UI/EffectsPanel.h"
 
 /** Simple honest panel for pages that are scheduled for a later phase. */
 class PlannedPanel : public juce::Component
@@ -72,7 +73,7 @@ private:
     ghostcut::DiscoverPanel discover;
     ghostcut::GeneratePanel generate;
     ghostcut::SequencePanel sequence;
-    PlannedPanel effects;
+    ghostcut::EffectsPanel effects;
     SettingsPanel settings;
     int currentTab = 0;
 

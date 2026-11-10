@@ -318,6 +318,7 @@ void SamplerEngine::noteOn (int note, float velocity, const Params& p) noexcept
     if (idx < 0 || idx >= (int) table->fragments.size()) return;
 
     const auto& f = table->fragments[(size_t) idx];
+    ratio *= p.keyPitchRatio;
     const float velGain = 1.0f - p.velocitySens + p.velocitySens * velocity * velocity;
     if (auto* v = allocateVoice())
     {
