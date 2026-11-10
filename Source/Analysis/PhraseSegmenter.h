@@ -15,6 +15,8 @@ struct FrameFeatures
     std::vector<float> centroid;  // spectral centroid, Hz
     std::vector<float> f0;        // Hz, 0 = unvoiced
     std::vector<float> clarity;   // 1 - YIN aperiodicity, 0..1
+    std::vector<float> hfRatio;   // energy share above 5 kHz
+    std::vector<float> flatness;  // spectral flatness 2-8 kHz (noise-likeness), 0..1
     double hopSeconds = 0.01;
     int numFrames() const noexcept { return (int) db.size(); }
 };
@@ -35,6 +37,8 @@ class PhraseSegmenter
 public:
     struct Settings
     {
+        enum class Granularity { Phrases = 0, Syllables = 1 };
+        Granularity granularity = Granularity::Phrases;
         float sensitivity   = 0.5f;   // 0..1, higher = more, smaller fragments
         float minGapMs      = 180.0f; // gaps shorter than this are merged
         float minLengthMs   = 200.0f;
@@ -57,7 +61,7 @@ public:
                                           const FrameFeatures& frames,
                                           const Settings& settings);
 
-    /** Measures features for an arbitrary region (used for manual fragments too). */
+    /** Measures features + heuristic scores for any region (manual fragments too). */
     static void measure (Fragment& f, const SourceSnapshot& src, const FrameFeatures& frames);
 };
 

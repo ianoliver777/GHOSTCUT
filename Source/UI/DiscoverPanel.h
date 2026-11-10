@@ -45,6 +45,11 @@ private:
 
     juce::TextButton importBtn { "Import" }, locateBtn { "Locate" }, analyzeBtn { "Analyze" }, clearBtn { "Clear" };
     juce::Slider sensitivity;
+    juce::ComboBox granularity;
+    juce::TextButton separateBtn { "Separate" }, viewOriginal { "Original" }, viewVocals { "Vocals" };
+    juce::TextEditor searchBox;
+    juce::ComboBox sortBox;
+    void stepSelection (int delta);
 
     WaveformView waveform;
     juce::TextButton playBtn { "Play" }, stopBtn { "Stop" }, loopBtn { "Loop" };
@@ -59,7 +64,7 @@ private:
     Knob baseNote, attack, release, velocity, gain;
 
     std::unique_ptr<juce::FileChooser> chooser;
-    juce::Rectangle<int> controlsArea, toolbarArea, transportArea;
+    juce::Rectangle<int> controlsArea, toolbarArea, transportArea, searchInfoArea;
 };
 
 } // namespace ghostcut

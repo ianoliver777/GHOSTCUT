@@ -6,8 +6,9 @@
 namespace ghostcut
 {
 
-/** List of detected / manual fragments. Click to select + audition, drag a row
-    out to the DAW to drop it as a WAV. */
+/** Fragment results browser. Rows follow the session's display order (time, a
+    character score, or search match). Click to select + audition, drag a row out
+    to the DAW to drop it as a WAV. */
 class FragmentList : public juce::Component,
                      private juce::ListBoxModel,
                      private juce::ChangeListener
@@ -18,6 +19,7 @@ public:
     void resized() override;
     void paint (juce::Graphics&) override;
     void refresh();
+    const std::vector<int>& getOrder() const noexcept { return order; }
 
 private:
     class Row;
@@ -31,9 +33,12 @@ private:
     std::function<int()> getBaseNote;
     std::function<bool()> isSlices;
     juce::ListBox list;
+    std::vector<int> order;
+    juce::String lastRankKey;
 };
 
-/** Details for the selected fragment + per-fragment actions. */
+/** Details for the selected fragment: measurements, heuristic character scores
+    (with the reasons behind them) and per-fragment actions. */
 class FragmentInspector : public juce::Component,
                           private juce::ChangeListener
 {
@@ -55,5 +60,8 @@ private:
     std::unique_ptr<DragHandle> dragHandle;
     std::unique_ptr<juce::FileChooser> chooser;
 };
+
+/** Draws a small horizontal 0..1 bar. */
+void drawScoreBar (juce::Graphics&, juce::Rectangle<float>, float value, juce::Colour);
 
 } // namespace ghostcut

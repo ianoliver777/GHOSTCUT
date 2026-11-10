@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "Analysis/OnnxRuntime.h"
 
 using namespace ghostcut;
 
@@ -37,10 +38,64 @@ SettingsPanel::SettingsPanel (Session& s) : session (s)
     addAndMakeVisible (bitDepth);
     openFolder.onClick = [] { auto f = AudioExporter::getDragExportFolder(); f.createDirectory(); f.startAsProcess(); };
     addAndMakeVisible (openFolder);
+
+    method.onChange = [this]
+    {
+        auto o = session.getSeparationOptions();
+        const int id = method.getSelectedId();
+        if (id == 1) o.method = VocalSeparator::Method::CenterExtract;
+        else if (id >= 10 && id - 10 < models.size()) { o.method = VocalSeparator::Method::MdxModel; o.model = models[id - 10]; }
+        session.setSeparationOptions (o);
+    };
+    addAndMakeVisible (method);
+
+    installModel.onClick = [this]
+    {
+        chooser = std::make_unique<juce::FileChooser> ("Install vocal model (.onnx)",
+                                                       juce::File::getSpecialLocation (juce::File::userHomeDirectory).getChildFile ("Downloads"),
+                                                       "*.onnx");
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                              [this] (const juce::FileChooser& fc)
+                              {
+                                  if (! fc.getResult().existsAsFile()) return;
+                                  VocalModelInfo info; juce::String err;
+                                  if (! VocalModels::install (fc.getResult(), info, err))
+                                  {
+                                      juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Model not installed", err);
+                                      return;
+                                  }
+                                  auto o = session.getSeparationOptions();
+                                  o.method = VocalSeparator::Method::MdxModel;
+                                  o.model = info;
+                                  session.setSeparationOptions (o);
+                                  refreshMethods();
+                              });
+    };
+    openModels.onClick = [] { auto f = VocalModels::getFolder(); f.createDirectory(); f.startAsProcess(); };
+    clearCache.onClick = [this] { VocalSeparator::clearCache(); repaint(); };
+    for (auto* b : { &installModel, &openModels, &clearCache }) addAndMakeVisible (b);
+
     session.addChangeListener (this);
+    refreshMethods();
 }
 
 SettingsPanel::~SettingsPanel() { session.removeChangeListener (this); }
+
+void SettingsPanel::refreshMethods()
+{
+    models = VocalModels::scan();
+    method.clear (juce::dontSendNotification);
+    method.addItem ("Center extract (DSP, stereo only)", 1);
+    for (int i = 0; i < models.size(); ++i)
+        method.addItem ("ML: " + models[i].displayName, 10 + i);
+    const auto o = session.getSeparationOptions();
+    int sel = 1;
+    if (o.method == VocalSeparator::Method::MdxModel)
+        for (int i = 0; i < models.size(); ++i) if (models[i].file == o.model.file) sel = 10 + i;
+    method.setSelectedId (sel, juce::dontSendNotification);
+    method.setItemEnabled (1, true);
+    repaint();
+}
 
 void SettingsPanel::changeListenerCallback (juce::ChangeBroadcaster*)
 {
@@ -50,46 +105,69 @@ void SettingsPanel::changeListenerCallback (juce::ChangeBroadcaster*)
 void SettingsPanel::paint (juce::Graphics& g)
 {
     g.fillAll (colours::bg);
-    auto r = getLocalBounds().reduced (40);
+    auto r = getLocalBounds().reduced (40, 30);
     g.setColour (colours::text);
     GhostLookAndFeel::drawTracked (g, "SETTINGS", r.removeFromTop (40).toFloat(), GhostLookAndFeel::label (26.0f, true), 0.3f,
                                    juce::Justification::centredLeft);
-    r.removeFromTop (10);
-    g.setColour (colours::textFaint);
-    g.setFont (GhostLookAndFeel::label (10.0f, true));
-    g.drawText ("EXPORT BIT DEPTH", r.removeFromTop (14), juce::Justification::centredLeft);
-    r.removeFromTop (40);
 
-    g.drawText ("STORAGE", r.removeFromTop (14), juce::Justification::centredLeft);
-    g.setColour (colours::textDim);
-    g.setFont (GhostLookAndFeel::label (12.5f));
-    const juce::StringArray lines {
-        "Projects store a reference to the source file (absolute path, size and a content fingerprint), not the audio.",
-        "Keep source files with your project, or use Live's Collect All and Save, then LOCATE if a path breaks.",
-        "Fragments, trim, selection and root notes are saved inside the DAW project.",
-        "Exports are written at the source's own sample rate. Unprocessed fragments are not resampled.",
-        "Drag-to-DAW renders go to: " + AudioExporter::getDragExportFolder().getFullPathName(),
+    auto heading = [&] (juce::Rectangle<int> area, const juce::String& t)
+    {
+        g.setColour (colours::textFaint);
+        g.setFont (GhostLookAndFeel::label (10.0f, true));
+        g.drawText (t, area.removeFromTop (14), juce::Justification::centredLeft);
     };
-    r.removeFromTop (4);
-    for (auto& l : lines) g.drawText (l, r.removeFromTop (20), juce::Justification::centredLeft);
+    auto lines = [&] (juce::Rectangle<int> area, const juce::StringArray& ls, juce::Colour c)
+    {
+        g.setColour (c);
+        g.setFont (GhostLookAndFeel::label (12.0f));
+        for (auto& l : ls) g.drawText (l, area.removeFromTop (19), juce::Justification::centredLeft, true);
+    };
 
-    r.removeFromTop (56);
-    g.setColour (colours::textFaint);
-    g.setFont (GhostLookAndFeel::label (10.0f, true));
-    g.drawText ("ABOUT", r.removeFromTop (14), juce::Justification::centredLeft);
-    g.setColour (colours::textDim);
-    g.setFont (GhostLookAndFeel::label (12.5f));
-    g.drawText (juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 1 build  /  TRIPLE SEVEN AUDIO",
-                r.removeFromTop (20), juce::Justification::centredLeft);
+    heading (method.getBounds().translated (0, -18).withHeight (14), "VOCAL SEPARATION");
+    auto& ort = OnnxRuntime::get();
+    const auto cacheMb = (double) VocalSeparator::getCacheSizeBytes() / (1024.0 * 1024.0);
+    lines (sepTextArea, {
+        ort.isAvailable() ? "ONNX Runtime " + ort.getVersion() + " loaded (CPU, offline)."
+                          : "ML unavailable: " + ort.getError(),
+        models.isEmpty() ? "No ML model installed. Center extract works on stereo mixes only. See README for supported models."
+                         : juce::String (models.size()) + " model(s) in " + VocalModels::getFolder().getFullPathName(),
+        "Model weights are not included with GHOSTCUT. Check each model's license before commercial use.",
+        "Separated stems are cached: " + juce::String (cacheMb, 1) + " MB in " + VocalSeparator::getCacheFolder().getFullPathName(),
+    }, colours::textDim);
+
+    heading (bitDepth.getBounds().translated (0, -18).withHeight (14), "EXPORT BIT DEPTH");
+
+    heading (storageArea, "PROJECT STORAGE");
+    lines (storageArea.withTrimmedTop (16), {
+        "Projects store a reference to the source file (path, size, fingerprint), not the audio.",
+        "Fragments, trim, view, search and root notes are saved in the DAW project. Isolated vocals reload from the stem cache.",
+        "Use Live's Collect All and Save, then LOCATE if a path breaks.",
+        "Drag-to-DAW renders: " + AudioExporter::getDragExportFolder().getFullPathName(),
+    }, colours::textDim);
+
+    heading (aboutArea, "ABOUT");
+    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 2 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
 }
 
 void SettingsPanel::resized()
 {
-    auto r = getLocalBounds().reduced (40);
-    r.removeFromTop (40 + 10 + 16);
-    bitDepth.setBounds (r.removeFromTop (26).withWidth (200));
-    r.removeFromTop (14 + 14 + 4 + 20 * 5 + 10);
-    openFolder.setBounds (r.removeFromTop (28).withWidth (160));
+    auto r = getLocalBounds().reduced (40, 30);
+    r.removeFromTop (40 + 26);
+    auto row = r.removeFromTop (26);
+    method.setBounds (row.removeFromLeft (320)); row.removeFromLeft (8);
+    installModel.setBounds (row.removeFromLeft (130)); row.removeFromLeft (6);
+    openModels.setBounds (row.removeFromLeft (150)); row.removeFromLeft (6);
+    clearCache.setBounds (row.removeFromLeft (140));
+    r.removeFromTop (8);
+    sepTextArea = r.removeFromTop (19 * 4);
+    r.removeFromTop (30);
+    auto row2 = r.removeFromTop (26);
+    bitDepth.setBounds (row2.removeFromLeft (200)); row2.removeFromLeft (8);
+    openFolder.setBounds (row2.removeFromLeft (160));
+    r.removeFromTop (24);
+    storageArea = r.removeFromTop (16 + 19 * 4);
+    r.removeFromTop (20);
+    aboutArea = r.removeFromTop (40);
 }
 
 //==============================================================================
@@ -125,8 +203,8 @@ GhostcutEditor::GhostcutEditor (GhostcutProcessor& p)
     session.addChangeListener (this);
 
     setResizable (true, true);
-    setResizeLimits (1000, 720, 2200, 1500);
-    setSize (1180, 800);
+    setResizeLimits (1100, 780, 2200, 1500);
+    setSize (1240, 860);
     showTab (0);
     startTimerHz (15);
 }

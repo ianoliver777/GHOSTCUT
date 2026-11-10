@@ -7,7 +7,7 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 
 ---
 
-## Status: Phase 1 (working plugin)
+## Status: Phase 2 (vocal intelligence)
 
 | Feature | State |
 |---|---|
@@ -21,14 +21,24 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 | MIDI playback: SLICES (one fragment per key) and CHROMATIC (selected fragment, pitched from its root) | ✅ working |
 | DAW state recall (parameters, source reference, trim, fragments, selection, settings) | ✅ working |
 | Missing-source handling (fragments kept, LOCATE to relink, fingerprint check) | ✅ working |
-| Vocal separation, scoring (ETHEREAL / HAUNTED / ...), search | ⏳ Phase 2 |
+| **Vocal separation**: ML (MDX-Net ONNX models, offline CPU) or DSP center extract, ORIGINAL / VOCALS switch, stem cache | ✅ working |
+| **Deeper analysis**: pitch contour, range, slope, bends, sustain, vibrato rate/depth, harmonicity, breathiness, air, attack/decay, jumps | ✅ working |
+| **Phrases / Syllables** detection granularity | ✅ working |
+| **Character scores** ETHEREAL / HAUNTED / NOSTALGIC / HEAVENLY / EXPERIMENTAL (labelled heuristics, each explains *why*) | ✅ working |
+| **Search**: describe what you want, mapped to measurable features, shows what it understood and ignored | ✅ working |
+| **Sort** by time, any score, or search match | ✅ working |
 | GENERATE / SEQUENCE | ⏳ Phase 3 |
 | EFFECTS | ⏳ Phase 4 |
 | GHOST MATCH, preset library | ⏳ Phase 5 |
 
 Tabs for unbuilt phases are visible but clearly marked as not built yet.
 
-### Verified so far
+### Verified in Phase 2
+- C++ MDX separation reproduces the Python/ONNX Runtime reference exactly: **19.95 dB SDR** on a speech + drums + bass test mix (the unseparated mix scores −9.97 dB). It runs at ~1.8× realtime on 4 CPU threads.
+- Unit tests: STFT perfect reconstruction (n_fft 7680 and 4096) and torch bin layout, resampler round-trip, center-extract, vibrato rate/depth, glide slope/bend, breathiness, attack, score sanity, syllable splitting, all four example searches from the brief, separation + recall from the stem cache.
+- pluginval strictness 10 with ONNX Runtime bundled in the VST3.
+
+### Verified in Phase 1
 - `GhostcutTests` passes (phrase detection at 44.1/48/96 kHz, pitch detection, lock-free handoff stress test, engine rendering + sample-rate ratio, bit-exact 24-bit export, save / restore / missing-file / relocate / trim).
 - VST3 builds clean on Linux and passes **pluginval at strictness 10**.
 - Standalone tested: import → 9/9 phrases found with correct pitches → quit → relaunch restores everything.
@@ -99,13 +109,66 @@ Something off? Note the step number and what the status bar said.
 
 ---
 
+## Vocal separation models
+
+GHOSTCUT runs MDX-Net vocal models through ONNX Runtime, fully offline on the CPU. **No model weights ship with the plugin.** To use ML separation:
+
+1. Download one of the supported models (both are 66 MB):
+   - `Kim_Vocal_2.onnx`: https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/Kim_Vocal_2.onnx
+   - `UVR-MDX-NET-Voc_FT.onnx`: https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Voc_FT.onnx
+2. GHOSTCUT → SETTINGS → **Install model…** and pick the file. It is verified by fingerprint and copied to `~/Music/TRIPLE SEVEN AUDIO/GHOSTCUT/Models/`.
+3. Choose it in the separation dropdown, then press **SEPARATE** on the Discover page.
+
+Only these two exact files are accepted, because their parameters (n_fft 7680, 3072 bins, 256 frames, output gain) were verified. Any other file is rejected with a message instead of producing garbage.
+
+**Without a model**, *Center extract (DSP)* still works on stereo mixes: it keeps L/R-coherent, centre-panned content above ~150 Hz. It's rougher than ML but has no licensing questions.
+
+> ⚠️ **Licensing before you sell:** these community models come from the UVR project. Their weights' terms for *commercial redistribution* are not clearly stated. That is why GHOSTCUT makes the user install them rather than bundling them. Before shipping a commercial build with a bundled or auto-downloaded model, get written confirmation from the model authors, or train or licence your own model. Phase 6 includes that licensing review.
+
+How it works: audio → 44.1 kHz stereo (Kaiser-windowed sinc resampler) → chunks of 261,120 samples with 3,840-sample trims → torch-compatible STFT (pocketfft) → model → ISTFT → back to the source rate. Separated stems are cached as 32-bit float WAV, keyed by source fingerprint + trim + model, so reopening a project or re-analysing is instant.
+
+## Search: what it understands
+
+Search is **keyword-to-feature mapping, not AI language understanding**. It turns words into measurable targets and always shows what it used and what it ignored:
+
+| You type | It looks for |
+|---|---|
+| high, high-pitched, soprano / low, deep | register |
+| falsetto | high register + some breath |
+| airy / breathy, whisper | energy above 5 kHz / aperiodicity + noise flatness |
+| sustained, held, long note, vowel | longest held note (pitch within ±0.75 st) |
+| short / long, `under 2 seconds`, `over 500ms` | fragment length |
+| descending, falling / rising | pitch slope |
+| bend, glide, slide | largest glide within 200 ms |
+| vibrato, wobbly | vibrato depth |
+| soft, gentle / loud | attack time, level |
+| dark, warm / bright | spectral centroid |
+| clean, pure, stable | harmonicity, pitch stability |
+| ghostly, eerie / ethereal, dreamy / heavenly, angelic / nostalgic / weird, glitchy, experimental | the matching character score |
+| reverse, reversing | long tail + sharp start (reverses into a swell) |
+| `above A3`, `below C4`, `around E4` | register (Ableton note names, C3 = 60) |
+| not / no + word | inverts it (`no vibrato`) |
+
+## Character scores (heuristics)
+
+Each score is a weighted mix of measured features. They're sorting aids, not emotion detection. The inspector lists the reasons behind the top score.
+
+- **ETHEREAL**: high register, breathy, airy top end, soft attack, held notes
+- **HAUNTED**: dark tone, long decay, pitch bends, unstable pitch, low register, quiet
+- **NOSTALGIC**: gentle vibrato, mid register, warm tone, held notes, steady melody
+- **HEAVENLY**: high register, pure tone, stable pitch, held notes, not breathy
+- **EXPERIMENTAL**: pitch jumps, big glides, wide range, busy spectrum, noisy / unvoiced
+
+Exact weights: `Source/Analysis/FragmentRanker.cpp`.
+
 ## Architecture
 
 ```
 Source/
   Core/        Fragment, SourceSnapshot, AudioThreadExchange (lock-free handoff), Session (model + state)
   Audio/       AudioImporter (decode, peaks, fingerprint), SamplerEngine (voices, MIDI), AudioExporter
-  Analysis/    PhraseSegmenter (energy / flux / YIN; frame features reused by Phase 2)
+  Analysis/    PhraseSegmenter (energy / flux / YIN, phrases + syllables), FeatureExtractor, FragmentRanker,
+               SearchQuery, VocalSeparator (MDX + center extract + cache), OnnxRuntime (dynamic loader), Stft
   UI/          GhostLookAndFeel, WaveformView, FragmentBrowser, DiscoverPanel
   PluginProcessor / PluginEditor
 Tests/         GhostcutTests console app
@@ -128,15 +191,17 @@ Planned additions follow the brief: `Analysis/VocalSeparator` (ONNX), `FeatureEx
 |---|---|---|---|
 | JUCE 8.0.15 | framework, MP3/WAV decoding, FFT | AGPLv3 **or** JUCE commercial licence | Selling closed-source requires a JUCE licence (free *Starter* tier below its revenue cap, check juce.com for current terms) |
 | JUCE MP3 decoder (`JUCE_USE_MP3AUDIOFORMAT`) | MP3 import | part of JUCE | MP3 patents have expired. On macOS CoreAudio also decodes MP3 |
-| Steinberg VST3 SDK (bundled in JUCE) | VST3 format | MIT (since SDK 3.8) | |
+| Steinberg VST3 SDK 3.8 (bundled in JUCE) | VST3 format | MIT | |
+| ONNX Runtime 1.20.1 | ML inference (CPU) | MIT | shared library copied into each bundle (`Contents/Frameworks` on mac, next to the binary on Windows) and loaded by absolute path at run time |
+| pocketfft (C++ header) | arbitrary-size FFT (n_fft 7680) | BSD-3-Clause | `ThirdParty/pocketfft` |
+| MDX-Net vocal models (Kim Vocal 2, UVR Voc FT) | vocal separation | **unclear for commercial redistribution** | not shipped. The user installs them, see above |
 | pluginval (CI only, not shipped) | validation | GPLv3 | tool, not linked |
 
-**Planned (not yet included), chosen for Phase 2+:**
-| Component | Purpose | License | Deployment note |
+**Planned:**
+| Component | Purpose | License | Note |
 |---|---|---|---|
-| ONNX Runtime | offline inference, mac arm64/x64 + win x64 | MIT | ship the dylib/dll inside the bundle |
-| Demucs (htdemucs) weights exported to ONNX | vocal / instrumental separation | code MIT; **confirm weight redistribution terms before shipping** | ~80 MB, so download on first use rather than bundling in the installer |
-| Signalsmith Stretch | time-stretch / pitch-shift | MIT | avoid Rubber Band (GPL unless commercially licensed) |
+| Signalsmith Stretch | time-stretch / pitch-shift (Phase 3) | MIT | avoid Rubber Band (GPL unless commercially licensed) |
+| Demucs (htdemucs) | possible higher-quality separation | code MIT | weights not reachable from the dev environment; MDX-Net chosen instead for Phase 2 |
 | CREPE-tiny (optional) | ML pitch upgrade over YIN | MIT | only if YIN proves insufficient on real vocals |
 
 ---
@@ -145,14 +210,16 @@ Planned additions follow the brief: `Analysis/VocalSeparator` (ONNX), `FeatureEx
 
 - The DAW project stores a **reference**, not the audio: the absolute path, the file size, a content fingerprint (FNV-1a over size + first/last 256 KB), and the trim range.
 - Fragments (start/end in samples, manual flag, root override, measured features), selection, loop, sensitivity and export bit depth are stored in the project.
-- No analysis cache is written to disk in Phase 1. Measurements are stored per fragment, and frame analysis re-runs in the background after a reload (seconds). Phase 2 adds an on-disk cache for separated stems, keyed by the fingerprint, in `~/Music/TRIPLE SEVEN AUDIO/GHOSTCUT/Cache`.
+- Isolated vocals are cached on disk in `~/Music/TRIPLE SEVEN AUDIO/GHOSTCUT/Cache` (key: fingerprint + trim + model). A reopened project reloads its vocals from there. If the cache was cleared, separation re-runs automatically (with progress). Frame measurements are recomputed in the background after load (seconds).
+- The project also stores the separation method, the ORIGINAL/VOCALS view, granularity, sort and search text.
 - Missing file → fragments are kept, the reference is kept (re-saving doesn't lose it), and LOCATE or dropping a file with the same name relinks it. A different file at the same path triggers a warning.
 - Drag-to-DAW renders are written to `~/Music/TRIPLE SEVEN AUDIO/GHOSTCUT/Fragments/` (not a temp folder) so Live's references survive reboots.
 - For full portability use Live's **File → Collect All and Save**, and keep sources inside the project folder.
 
 ## Known Phase 1 limitations
-- Phrase detection is tuned for **isolated vocals / acapellas**. On full mixes everything is "active", so cuts land on energy dips. Vocal separation (Phase 2) fixes this.
-- Measurements (pitch, voicing, brightness) are shown as raw numbers. Character scores arrive in Phase 2 as explicitly labelled heuristics.
+- ML separation runs on the CPU (~1.8× realtime with 4 threads). A 4-minute song takes about 2 minutes the first time, then it's instant from the cache. It deliberately uses half your cores so the DAW keeps playing.
+- Character scores and breathiness are heuristics from measured features. The weights were tuned on synthetic material and should be tuned further on real vocals.
+- Pitch tracking is YIN (70–1100 Hz). Very breathy or whispered material often has no stable pitch, which is shown as "no stable pitch".
 - Stealing a voice when all 32 are busy restarts it without a crossfade (rare, may click).
 - Binaries are not code-signed or notarized yet (Phase 6).
 - AU manufacturer code `T7Au` / plugin code `Ghct`. If other TRIPLE SEVEN AUDIO plugins already use a different manufacturer code, align it **before the first public release** (changing it later breaks saved projects).

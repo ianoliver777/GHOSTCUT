@@ -4,6 +4,12 @@
 #include "Audio/AudioExporter.h"
 #include "Audio/AudioImporter.h"
 #include "Audio/SamplerEngine.h"
+#include "Analysis/Stft.h"
+#include "Analysis/VocalSeparator.h"
+#include "Analysis/OnnxRuntime.h"
+#include "Analysis/FeatureExtractor.h"
+#include "Analysis/FragmentRanker.h"
+#include "Analysis/SearchQuery.h"
 #include <juce_events/juce_events.h>
 
 using namespace ghostcut;
@@ -373,6 +379,366 @@ struct SessionTests : juce::UnitTest
         dir.deleteRecursively();
     }
 };
+
+
+//==============================================================================
+// Phase 2
+//==============================================================================
+namespace
+{
+    /** Tone with controllable vibrato, glide and breath noise. */
+    std::shared_ptr<SourceSnapshot> makeVoice (double sr, double len, double hzStart, double hzEnd,
+                                               double vibRate, double vibDepthSemis, double noise, double attack = 0.03)
+    {
+        auto s = std::make_shared<SourceSnapshot>();
+        s->sampleRate = sr;
+        const int pad = (int) (0.3 * sr), n = (int) (len * sr);
+        s->audio.setSize (1, n + 2 * pad);
+        s->audio.clear();
+        juce::Random rng (99);
+        double phase = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double t = i / sr;
+            const double base = hzStart * std::pow (hzEnd / hzStart, t / len);
+            const double f = base * std::pow (2.0, vibDepthSemis / 12.0 * std::sin (2.0 * juce::MathConstants<double>::pi * vibRate * t));
+            phase += 2.0 * juce::MathConstants<double>::pi * f / sr;
+            const double env = std::min ({ 1.0, t / attack, (len - t) / 0.08 });
+            const double v = 0.5 * std::sin (phase) + 0.25 * std::sin (2 * phase) + 0.12 * std::sin (3 * phase)
+                             + noise * (rng.nextFloat() * 2.0 - 1.0);
+            s->audio.setSample (0, pad + i, (float) (0.4 * env * v));
+        }
+        s->peaks.build (s->audio);
+        return s;
+    }
+
+    Fragment measureWhole (const SourceSnapshot& s)
+    {
+        auto frames = PhraseSegmenter::computeFrames (s);
+        Fragment f;
+        f.start = (int64_t) (0.3 * s.sampleRate);
+        f.end = s.numSamples() - (int64_t) (0.3 * s.sampleRate);
+        PhraseSegmenter::measure (f, s, frames);
+        return f;
+    }
+
+    float sdrDb (const juce::AudioBuffer<float>& ref, const juce::AudioBuffer<float>& est)
+    {
+        double num = 0, den = 0;
+        for (int c = 0; c < ref.getNumChannels(); ++c)
+            for (int i = 0; i < std::min (ref.getNumSamples(), est.getNumSamples()); ++i)
+            {
+                const double r = ref.getSample (c, i), e = est.getSample (c, i);
+                num += r * r; den += (r - e) * (r - e);
+            }
+        return (float) (10.0 * std::log10 (num / std::max (den, 1e-20)));
+    }
+
+    juce::AudioBuffer<float> readWav (const juce::File& f, double& sr)
+    {
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> r (wav.createReaderFor (f.createInputStream().release(), true));
+        juce::AudioBuffer<float> b;
+        if (r == nullptr) return b;
+        b.setSize ((int) r->numChannels, (int) r->lengthInSamples);
+        r->read (&b, 0, b.getNumSamples(), 0, true, true);
+        sr = r->sampleRate;
+        return b;
+    }
+}
+
+struct StftTests : juce::UnitTest
+{
+    StftTests() : juce::UnitTest ("Stft", "GHOSTCUT") {}
+    void runTest() override
+    {
+        for (int nfft : { 7680, 4096 })
+        {
+            beginTest ("perfect reconstruction, n_fft " + juce::String (nfft));
+            Stft st (nfft, 1024);
+            juce::Random rng (5);
+            std::vector<float> x (50000), y (50000);
+            for (auto& v : x) v = rng.nextFloat() * 2.0f - 1.0f;
+            std::vector<std::complex<float>> spec;
+            st.forward (x.data(), (int) x.size(), spec);
+            st.inverse (spec, st.numFrames ((int) x.size()), (int) x.size(), y.data());
+            float err = 0.0f;
+            for (size_t i = 0; i < x.size(); ++i) err = std::max (err, std::abs (x[i] - y[i]));
+            expectLessThan (err, 1.0e-4f);
+        }
+
+        beginTest ("sine lands in the right bin (torch layout)");
+        Stft st (7680, 1024);
+        std::vector<float> x (261120);
+        const int bin = 300; // 300 * 44100 / 7680 = 1722.66 Hz
+        for (size_t i = 0; i < x.size(); ++i) x[i] = std::sin (2.0 * juce::MathConstants<double>::pi * bin * (double) i / 7680.0);
+        std::vector<std::complex<float>> spec;
+        st.forward (x.data(), (int) x.size(), spec);
+        expectEquals (st.numFrames ((int) x.size()), 256); // MDX chunk -> dim_t
+        const int frames = 256, mid = 128;
+        int best = 0; float bestMag = 0;
+        for (int b = 0; b < st.numBins(); ++b)
+            if (std::abs (spec[(size_t) b * frames + mid]) > bestMag) { bestMag = std::abs (spec[(size_t) b * frames + mid]); best = b; }
+        expectEquals (best, bin);
+        expectWithinAbsoluteError (bestMag, 7680.0f / 4.0f, 10.0f); // hann coherent gain * N/2
+    }
+};
+
+struct SeparationTests : juce::UnitTest
+{
+    SeparationTests() : juce::UnitTest ("VocalSeparator", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("resample round trip 48k -> 44.1k -> 48k");
+        {
+            juce::AudioBuffer<float> b (1, 48000);
+            for (int i = 0; i < 48000; ++i) b.setSample (0, i, (float) std::sin (2.0 * juce::MathConstants<double>::pi * 1000.0 * i / 48000.0));
+            auto a = VocalSeparator::resample (b, 48000, 44100);
+            expectEquals (a.getNumSamples(), 44100);
+            auto c = VocalSeparator::resample (a, 44100, 48000);
+            float err = 0.0f;
+            for (int i = 2000; i < 46000; ++i) err = std::max (err, std::abs (c.getSample (0, i) - b.getSample (0, i)));
+            expectLessThan (err, 0.02f);
+        }
+
+        beginTest ("center extract keeps centre, removes sides and bass");
+        {
+            const int n = 44100 * 3;
+            juce::AudioBuffer<float> mix (2, n), centre (2, n);
+            juce::Random rng (3);
+            for (int i = 0; i < n; ++i)
+            {
+                const float c = 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 440.0 * i / 44100.0);
+                const float side = 0.3f * (rng.nextFloat() * 2.0f - 1.0f);
+                const float bass = 0.4f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 50.0 * i / 44100.0);
+                centre.setSample (0, i, c); centre.setSample (1, i, c);
+                mix.setSample (0, i, c + side + bass);
+                mix.setSample (1, i, c - side + bass);
+            }
+            juce::AudioBuffer<float> out;
+            expect (VocalSeparator::runCenterExtract (mix, out, {}, {}));
+            expectGreaterThan (sdrDb (centre, out), sdrDb (centre, mix) + 10.0f);
+        }
+
+        beginTest ("ONNX Runtime loads from next to the binary");
+        {
+            auto& ort = OnnxRuntime::get();
+            logMessage ("ORT: " + (ort.isAvailable() ? ort.getVersion() + " @ " + ort.getLibraryFile().getFullPathName() : ort.getError()));
+           #if GHOSTCUT_HAS_ORT
+            expect (ort.isAvailable(), ort.getError());
+           #endif
+        }
+
+        // Real-model test: set GHOSTCUT_TEST_MODEL=/path/Kim_Vocal_2.onnx and
+        // GHOSTCUT_TEST_MIX_DIR=<folder with mix.wav + voc_true.wav>
+        const auto modelPath = juce::SystemStats::getEnvironmentVariable ("GHOSTCUT_TEST_MODEL", {});
+        const auto mixDir = juce::SystemStats::getEnvironmentVariable ("GHOSTCUT_TEST_MIX_DIR", {});
+        if (modelPath.isNotEmpty() && mixDir.isNotEmpty())
+        {
+            beginTest ("MDX model separates vocals (real model)");
+            VocalModelInfo info; juce::String err;
+            expect (VocalModels::inspect (juce::File (modelPath), info, err), err);
+            double sr = 0;
+            auto mix = readWav (juce::File (mixDir).getChildFile ("mix.wav"), sr);
+            auto ref = readWav (juce::File (mixDir).getChildFile ("voc_true.wav"), sr);
+            juce::AudioBuffer<float> voc;
+            const auto t0 = juce::Time::getMillisecondCounterHiRes();
+            expect (VocalSeparator::runMdx (mix, info, std::max (1, juce::SystemStats::getNumCpus() / 2), voc, {}, {}, err), err);
+            const auto secs = (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0;
+            const float sdr = sdrDb (ref, voc), base = sdrDb (ref, mix);
+            logMessage ("MDX SDR " + juce::String (sdr, 2) + " dB (mix baseline " + juce::String (base, 2) + " dB), "
+                        + juce::String (secs, 1) + " s for " + juce::String (mix.getNumSamples() / sr, 1) + " s audio");
+            expectGreaterThan (sdr, 15.0f);
+        }
+        else logMessage ("(skipping real-model test: GHOSTCUT_TEST_MODEL not set)");
+    }
+};
+
+struct FeatureTests : juce::UnitTest
+{
+    FeatureTests() : juce::UnitTest ("FeatureExtractor", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("vibrato rate and depth");
+        auto vib = measureWhole (*makeVoice (44100, 2.0, 330, 330, 5.5, 0.5, 0.0));
+        expectWithinAbsoluteError (vib.features.vibratoRateHz, 5.5f, 0.8f);
+        expectWithinAbsoluteError (vib.features.vibratoDepthSemis, 0.5f, 0.25f);
+        auto flat = measureWhole (*makeVoice (44100, 2.0, 330, 330, 0, 0, 0.0));
+        expectEquals (flat.features.vibratoRateHz, 0.0f);
+        expectGreaterThan (flat.features.sustainSec, 1.6f);
+
+        beginTest ("descending glide: slope, bend, range");
+        auto glide = measureWhole (*makeVoice (44100, 1.5, 440, 220, 0, 0, 0.0));
+        expectLessThan (glide.features.pitchSlope, -5.0f);           // ~ -8 st/s
+        expectGreaterThan (glide.features.bendSemis, 1.0f);
+        expectGreaterThan (glide.features.pitchRangeSemis, 9.0f);
+        expectLessThan (glide.features.sustainSec, 0.4f);
+
+        beginTest ("breathiness: noisy > clean");
+        auto breathy = measureWhole (*makeVoice (44100, 1.5, 330, 330, 0, 0, 0.6));
+        expectGreaterThan (breathy.features.breathiness, flat.features.breathiness + 0.1f);
+        expectGreaterThan (breathy.features.airiness, flat.features.airiness);
+
+        beginTest ("attack time");
+        auto slow = measureWhole (*makeVoice (44100, 1.5, 330, 330, 0, 0, 0.0, 0.4));
+        expectGreaterThan (slow.features.attackSec, 0.2f);
+        expectLessThan (flat.features.attackSec, 0.1f);
+
+        beginTest ("scores separate obvious cases");
+        auto high = measureWhole (*makeVoice (44100, 2.0, 784, 784, 0, 0, 0.0)); // G5, pure, held
+        expectGreaterThan (high.scores[FragmentScores::Heavenly], high.scores[FragmentScores::Experimental]);
+        expectGreaterThan (high.scores[FragmentScores::Heavenly], 0.6f);
+        expectGreaterThan (vib.scores[FragmentScores::Nostalgic], flat.scores[FragmentScores::Nostalgic]);
+        expectGreaterThan (glide.scores[FragmentScores::Haunted] + glide.scores[FragmentScores::Experimental],
+                           flat.scores[FragmentScores::Haunted] + flat.scores[FragmentScores::Experimental]);
+        expect (FragmentRanker::explain (high, FragmentScores::Heavenly, 4).contains ("held note"));
+
+        beginTest ("syllable granularity cuts more than phrases");
+        {
+            auto src = std::make_shared<SourceSnapshot>();
+            src->sampleRate = 44100;
+            src->audio.setSize (1, 44100 * 3);
+            src->audio.clear();
+            // one continuous phrase of 6 "syllables": level dips between notes, no silence
+            double phase = 0.0;
+            const double notes[] = { 262, 294, 330, 349, 392, 440 };
+            for (int i = 0; i < 44100 * 3; ++i)
+            {
+                const double t = i / 44100.0;
+                const int k = std::min (5, (int) ((t - 0.2) / 0.43));
+                const double local = std::fmod (t - 0.2, 0.43);
+                const double env = (t < 0.2 || t > 2.78) ? 0.0 : 0.25 + 0.75 * std::sin (juce::MathConstants<double>::pi * local / 0.43);
+                phase += 2.0 * juce::MathConstants<double>::pi * notes[std::max (0, k)] / 44100.0;
+                src->audio.setSample (0, i, (float) (0.3 * env * std::sin (phase)));
+            }
+            auto frames = PhraseSegmenter::computeFrames (*src);
+            PhraseSegmenter::Settings st;
+            const auto phrases = PhraseSegmenter::segment (*src, frames, st);
+            st.granularity = PhraseSegmenter::Settings::Granularity::Syllables;
+            const auto syl = PhraseSegmenter::segment (*src, frames, st);
+            logMessage ("phrases " + juce::String ((int) phrases.size()) + ", syllables " + juce::String ((int) syl.size()));
+            expectEquals ((int) phrases.size(), 1);
+            expectGreaterOrEqual ((int) syl.size(), 5);
+            expectLessOrEqual ((int) syl.size(), 7);
+        }
+    }
+};
+
+struct SearchTests : juce::UnitTest
+{
+    SearchTests() : juce::UnitTest ("SearchQuery", "GHOSTCUT") {}
+
+    static bool has (const SearchQuery& q, const juce::String& label)
+    {
+        for (auto& c : q.constraints) if (c.label == label) return true;
+        return false;
+    }
+
+    void runTest() override
+    {
+        beginTest ("brief example queries map to features");
+        auto q1 = SearchQuery::parse ("Airy high-pitched vocal with a sustained vowel.");
+        expect (has (q1, "airy top end") && has (q1, "high register") && has (q1, "held note"));
+        expect (q1.ignoredWords.isEmpty(), q1.ignoredWords.joinIntoString (","));
+
+        auto q2 = SearchQuery::parse ("Soft, breathy vocal with descending melody.");
+        expect (has (q2, "soft attack") && has (q2, "breathy") && has (q2, "descending"));
+
+        auto q3 = SearchQuery::parse ("Long falsetto note with an unusual pitch bend.");
+        expect (has (q3, "held note") && has (q3, "high register") && has (q3, "pitch bend") && has (q3, "EXPERIMENTAL score"));
+
+        auto q4 = SearchQuery::parse ("Short ghostly vocal fragment suitable for reversing.");
+        expect (has (q4, "short") && has (q4, "HAUNTED score") && has (q4, "long tail (reverses into a swell)"));
+        expect (q4.ignoredWords.isEmpty(), q4.ignoredWords.joinIntoString (","));
+
+        beginTest ("numbers, notes, negation, unknown words");
+        auto q5 = SearchQuery::parse ("under 2 seconds above A3 no vibrato zorblax");
+        expect (has (q5, "length <= 2.0 s"));
+        expect (has (q5, "register above A3"));
+        expect (has (q5, "not vibrato"));
+        expect (q5.ignoredWords.contains ("zorblax"));
+        auto q6 = SearchQuery::parse ("around e4 under 500ms");
+        expect (has (q6, "register near E4") && has (q6, "length <= 0.50 s"));
+
+        beginTest ("matching ranks the right fragment first");
+        auto high = measureWhole (*makeVoice (44100, 2.0, 784, 784, 0, 0, 0.35)); // high, held, breathy
+        auto low = measureWhole (*makeVoice (44100, 0.6, 130, 110, 0, 0, 0.0));   // low, short, falling
+        expectGreaterThan (q1.match (high), q1.match (low) + 0.3f);
+        auto q7 = SearchQuery::parse ("short deep descending");
+        expectGreaterThan (q7.match (low), q7.match (high) + 0.3f);
+    }
+};
+
+struct SeparationSessionTests : juce::UnitTest
+{
+    SeparationSessionTests() : juce::UnitTest ("Session separation", "GHOSTCUT") {}
+    void runTest() override
+    {
+        auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ghostcut_sep_test");
+        dir.deleteRecursively();
+        dir.createDirectory();
+        auto wavFile = dir.getChildFile ("stereo_mix.wav");
+        {
+            auto src = makeTestSource (44100.0, 2);
+            auto& a = const_cast<juce::AudioBuffer<float>&> (src->audio);
+            juce::Random rng (11);
+            for (int i = 0; i < a.getNumSamples(); ++i)
+            {
+                const float side = 0.05f * (rng.nextFloat() * 2.0f - 1.0f);
+                a.addSample (0, i, side); a.addSample (1, i, -side);
+            }
+            expect (AudioExporter::writeRegion (*src, 0, src->numSamples(), wavFile, AudioExporter::BitDepth::Float32).isEmpty());
+        }
+
+        SamplerEngine engine;
+        juce::ValueTree saved;
+        VocalSeparator::Options opts;
+        opts.method = VocalSeparator::Method::CenterExtract;
+
+        beginTest ("separate -> vocals view -> re-analysis");
+        {
+            Session s (engine);
+            s.setSeparationOptions (opts);
+            s.importFile (wavFile);
+            expect (waitUntil ([&] { return s.hasSource() && ! s.isBusy() && ! s.getFragments().empty(); }));
+            s.separate();
+            expect (waitUntil ([&] { return s.hasVocals() && ! s.isBusy(); }), s.getStatusText());
+            expect (s.getView() == Session::View::Vocals);
+            expect (s.getSnapshot() != s.getOriginalSnapshot());
+            expectEquals ((int) s.getFragments().size(), 3);
+            expect (VocalSeparator::cacheFileFor (*s.getOriginalSnapshot(), opts).existsAsFile());
+
+            beginTest ("search + sort order");
+            s.setSearchText ("high sustained");
+            expect (s.getSort() == Session::Sort::Match);
+            const auto order = s.getDisplayOrder();
+            expectEquals (order.front(), 2); // A4 is the highest of the three
+            saved = s.getStateTree();
+        }
+
+        beginTest ("restore brings back vocals from cache and the search");
+        {
+            Session s (engine);
+            s.setStateTreeFromAnyThread (saved);
+            expect (waitUntil ([&] { return s.hasVocals() && ! s.isBusy(); }), s.getStatusText());
+            expect (s.getView() == Session::View::Vocals);
+            expectEquals (s.getSearchText(), juce::String ("high sustained"));
+            expect (s.getStatusText().contains ("cached") || s.getStatusText().contains ("ready"), s.getStatusText());
+            expectEquals ((int) s.getFragments().size(), 3);
+            expect (s.getFragments()[0].measured);
+        }
+
+        VocalSeparator::clearCache();
+        engine.resetWhileAudioStopped();
+        dir.deleteRecursively();
+    }
+};
+
+static StftTests stftTests;
+static SeparationTests separationTests;
+static FeatureTests featureTests;
+static SearchTests searchTests;
+static SeparationSessionTests separationSessionTests;
 
 static SegmenterTests segmenterTests;
 static ExchangeTests exchangeTests;

@@ -1,4 +1,5 @@
 #include "Session.h"
+#include <numeric>
 
 namespace ghostcut
 {
@@ -13,9 +14,21 @@ namespace ids
     static const juce::Identifier f0 { "f0" }, voiced { "voiced" }, stab { "stab" }, meanDb { "meanDb" }, peakDb { "peakDb" }, cent { "cent" };
     static const juce::Identifier selected { "selected" }, selStart { "selStart" }, selEnd { "selEnd" }, loop { "loop" };
     static const juce::Identifier sensitivity { "sensitivity" }, exportBits { "exportBits" }, version { "version" };
+    static const juce::Identifier view { "view" }, granularity { "granularity" }, sort { "sort" }, search { "search" };
+    static const juce::Identifier vocalsMethod { "vocalsMethod" }, sepMethod { "sepMethod" }, sepModel { "sepModel" };
 }
 
-Session::Session (SamplerEngine& e) : engine (e)
+static VocalSeparator::Options defaultSeparationOptions()
+{
+    VocalSeparator::Options o;
+    o.threads = std::max (1, juce::SystemStats::getNumCpus() / 2); // leave headroom for the DAW
+    const auto models = VocalModels::scan();
+    if (! models.isEmpty()) { o.method = VocalSeparator::Method::MdxModel; o.model = models.getReference (0); }
+    else o.method = VocalSeparator::Method::CenterExtract;
+    return o;
+}
+
+Session::Session (SamplerEngine& e) : engine (e), sepOptions (defaultSeparationOptions())
 {
     updateStateCache();
 }
@@ -92,8 +105,12 @@ void Session::startLoad (const juce::File& f, int64_t trimStart, int64_t trimEnd
             }
 
             snapshot = result.snapshot;
+            vocals.reset();
+            vocalsLabel.clear();
+            vocalsMethodId.clear();
+            if (autoAnalyze) { view = View::Original; pendingVocalsMethod.clear(); }
             frames.reset();
-            engine.publishSource (snapshot);
+            publishPlayback();
 
             const auto n = snapshot->numSamples();
             if (autoAnalyze)
@@ -119,7 +136,8 @@ void Session::startLoad (const juce::File& f, int64_t trimStart, int64_t trimEnd
             if (changed) msg = snapshot->displayName + " loaded, but the file differs from the one saved in this project. Fragment positions may be off.";
             setStatus (msg, changed);
 
-            startFrameAnalysis (autoAnalyze);
+            if (! autoAnalyze && pendingVocalsMethod.isNotEmpty()) startSeparation (true);
+            else startFrameAnalysis (autoAnalyze);
         });
     });
 }
@@ -132,7 +150,8 @@ void Session::analyze()
         // frames are cached: re-segmenting is instant and needs no worker
         PhraseSegmenter::Settings s;
         s.sensitivity = sensitivity;
-        auto found = PhraseSegmenter::segment (*snapshot, *frames, s);
+        s.granularity = granularity;
+        auto found = PhraseSegmenter::segment (*analysisSnapshot(), *frames, s);
         std::vector<Fragment> manual;
         for (auto& f : fragments) if (f.manual) manual.push_back (f);
         fragments = std::move (found);
@@ -140,7 +159,7 @@ void Session::analyze()
         for (auto& f : manual) fragments.push_back (f);
         selectedIndex = fragments.empty() ? -1 : 0;
         sortAndPublish (fragments.empty() ? -1 : fragments.front().uid);
-        setStatus (juce::String (fragments.size()) + " fragments found");
+        setStatus (juce::String (fragments.size()) + " fragments found" + (vocals != nullptr ? " in isolated vocals" : ""));
         return;
     }
     startFrameAnalysis (true);
@@ -154,7 +173,7 @@ void Session::startFrameAnalysis (bool segmentAfter)
     progress = 0.0f;
     setStatus (segmentAfter ? "Analyzing phrases..." : "Measuring audio...");
 
-    auto snap = snapshot;
+    auto snap = analysisSnapshot();
     auto aliveFlag = alive;
     runJob ("frames", [this, aliveFlag, gen, snap, segmentAfter]
     {
@@ -168,12 +187,12 @@ void Session::startFrameAnalysis (bool segmentAfter)
             if (ff->numFrames() == 0) { setStatus ("Analysis cancelled", true); return; }
             frames = ff;
 
-            // fill in features for any fragment that has none yet (e.g. manual, pre-analysis)
-            for (auto& f : fragments)
-                if (f.features.meanDb <= -100.0f) PhraseSegmenter::measure (f, *snapshot, *frames);
+            // (re)measure everything against the current analysis audio
+            for (auto& f : fragments) PhraseSegmenter::measure (f, *analysisSnapshot(), *frames);
 
             if (segmentAfter) analyze();
             else { publishTable(); updateStateCache(); setStatus (snapshot->displayName + " ready"); }
+            sendChangeMessage();
         });
     });
 }
@@ -183,6 +202,12 @@ void Session::trimToSelection()
     if (snapshot == nullptr || ! hasSelection()) return;
     auto cropped = AudioImporter::crop (*snapshot, selStart, selEnd);
     if (cropped == nullptr) { setStatus ("Selection too short to trim", true); return; }
+    std::shared_ptr<SourceSnapshot> croppedVocals;
+    if (vocals != nullptr)
+    {
+        croppedVocals = AudioImporter::crop (*vocals, selStart, selEnd);
+        if (croppedVocals != nullptr) croppedVocals->displayName = vocals->displayName;
+    }
 
     // shift fragments into the new coordinates; drop those that fall outside
     const int64_t off = selStart, len = selEnd - selStart;
@@ -197,10 +222,12 @@ void Session::trimToSelection()
     engine.sendCommand ({ EngineCommand::Type::StopAll });
     generation.fetch_add (1);
     snapshot = cropped;
+    vocals = croppedVocals;
+    if (vocals == nullptr) { view = View::Original; vocalsMethodId.clear(); }
     frames.reset();
     fragments = std::move (kept);
     selStart = selEnd = 0;
-    engine.publishSource (snapshot);
+    publishPlayback();
     sortAndPublish (-1);
     setStatus ("Trimmed to " + juce::String (snapshot->lengthSeconds(), 2) + " s");
     startFrameAnalysis (false);
@@ -223,7 +250,7 @@ void Session::setFragmentBounds (int index, int64_t start, int64_t end)
     auto& f = fragments[(size_t) index];
     f.start = juce::jlimit<int64_t> (0, n - minLen, start);
     f.end = juce::jlimit<int64_t> (f.start + minLen, n, end);
-    if (frames != nullptr) PhraseSegmenter::measure (f, *snapshot, *frames);
+    if (frames != nullptr) PhraseSegmenter::measure (f, *analysisSnapshot(), *frames);
     sortAndPublish (f.uid);
 }
 
@@ -258,7 +285,7 @@ int Session::addFragmentFromSelection()
     f.manual = true;
     f.start = selStart;
     f.end = selEnd;
-    if (frames != nullptr) PhraseSegmenter::measure (f, *snapshot, *frames);
+    if (frames != nullptr) PhraseSegmenter::measure (f, *analysisSnapshot(), *frames);
     fragments.push_back (f);
     sortAndPublish (f.uid);
     return selectedIndex;
@@ -335,18 +362,22 @@ void Session::stop() { engine.sendCommand ({ EngineCommand::Type::StopAll }); }
 //==============================================================================
 juce::String Session::exportFragment (int index, const juce::File& dest) const
 {
-    if (snapshot == nullptr) return "No audio loaded";
+    auto snap = getSnapshot();
+    if (snap == nullptr) return "No audio loaded";
     if (index < 0 || index >= (int) fragments.size()) return "No fragment selected";
     const auto& f = fragments[(size_t) index];
-    return AudioExporter::writeRegion (*snapshot, f.start, f.end, dest, exportDepth);
+    return AudioExporter::writeRegion (*snap, f.start, f.end, dest, exportDepth);
 }
 
 juce::File Session::renderFragmentForDrag (int index, juce::String& error) const
 {
-    if (snapshot == nullptr || index < 0 || index >= (int) fragments.size()) { error = "No fragment"; return {}; }
+    auto snap = getSnapshot();
+    if (snap == nullptr || index < 0 || index >= (int) fragments.size()) { error = "No fragment"; return {}; }
     const auto& f = fragments[(size_t) index];
-    auto dest = AudioExporter::getDragExportFolder().getChildFile (AudioExporter::makeFragmentFileName (*snapshot, index + 1, f.start));
-    error = AudioExporter::writeRegion (*snapshot, f.start, f.end, dest, exportDepth);
+    auto name = AudioExporter::makeFragmentFileName (*snapshot, index + 1, f.start);
+    if (view == View::Vocals && vocals != nullptr) name = name.replace (".wav", "_vocals.wav");
+    auto dest = AudioExporter::getDragExportFolder().getChildFile (name);
+    error = AudioExporter::writeRegion (*snap, f.start, f.end, dest, exportDepth);
     return error.isEmpty() ? dest : juce::File();
 }
 
@@ -361,6 +392,13 @@ void Session::updateStateCache()
     t.setProperty (ids::selStart, (juce::int64) selStart, nullptr);
     t.setProperty (ids::selEnd, (juce::int64) selEnd, nullptr);
     t.setProperty (ids::loop, loop, nullptr);
+    t.setProperty (ids::view, (int) view, nullptr);
+    t.setProperty (ids::granularity, (int) granularity, nullptr);
+    t.setProperty (ids::sort, (int) sort, nullptr);
+    t.setProperty (ids::search, searchText, nullptr);
+    t.setProperty (ids::vocalsMethod, vocals != nullptr ? vocalsMethodId : pendingVocalsMethod, nullptr);
+    t.setProperty (ids::sepMethod, (int) sepOptions.method, nullptr);
+    t.setProperty (ids::sepModel, sepOptions.model.file.getFileName(), nullptr);
 
     juce::ValueTree src (ids::source);
     if (snapshot != nullptr)
@@ -441,6 +479,22 @@ void Session::restoreOnMessageThread (const juce::ValueTree& t)
     loop = (bool) t.getProperty (ids::loop, false);
     selStart = (juce::int64) t.getProperty (ids::selStart, 0);
     selEnd = (juce::int64) t.getProperty (ids::selEnd, 0);
+    view = (View) (int) t.getProperty (ids::view, 0);
+    granularity = (Granularity) (int) t.getProperty (ids::granularity, 0);
+    sort = (Sort) juce::jlimit (0, 6, (int) t.getProperty (ids::sort, 0));
+    searchText = t.getProperty (ids::search).toString();
+    search = SearchQuery::parse (searchText);
+    pendingVocalsMethod = t.getProperty (ids::vocalsMethod).toString();
+    {
+        const auto m = (VocalSeparator::Method) (int) t.getProperty (ids::sepMethod, (int) sepOptions.method);
+        const auto modelName = t.getProperty (ids::sepModel).toString();
+        if (m == VocalSeparator::Method::MdxModel)
+        {
+            for (auto& info : VocalModels::scan())
+                if (info.file.getFileName() == modelName) { sepOptions.method = m; sepOptions.model = info; }
+        }
+        else sepOptions.method = m;
+    }
 
     std::vector<Fragment> restored;
     for (auto n : t.getChildWithName (ids::fragmentsNode))
@@ -473,6 +527,7 @@ void Session::restoreOnMessageThread (const juce::ValueTree& t)
     // drop whatever is loaded now
     generation.fetch_add (1);
     snapshot.reset();
+    vocals.reset();
     frames.reset();
     engine.publishSource (nullptr);
     fragments = restored;
@@ -498,6 +553,112 @@ void Session::restoreOnMessageThread (const juce::ValueTree& t)
 
     missingSource = juce::File();
     startLoad (file, trimS, trimE, false, std::move (restored), hash);
+}
+
+//==============================================================================
+void Session::publishPlayback()
+{
+    engine.sendCommand ({ EngineCommand::Type::StopAll });
+    engine.publishSource (getSnapshot());
+}
+
+void Session::setView (View v)
+{
+    if (v == View::Vocals && vocals == nullptr) return;
+    view = v;
+    publishPlayback();
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::separate()
+{
+    if (snapshot == nullptr) { setStatus ("Import audio first", true); return; }
+    if (busy) return;
+    startSeparation (false);
+}
+
+void Session::startSeparation (bool restoring)
+{
+    if (snapshot == nullptr) return;
+    auto opts = sepOptions;
+    if (opts.method == VocalSeparator::Method::None) { startFrameAnalysis (! restoring); return; }
+
+    const int gen = generation.load();
+    busy = true;
+    progress = 0.0f;
+    setStatus ("Separating vocals: " + VocalSeparator::methodLabel (opts) + "...");
+
+    auto src = snapshot;
+    auto aliveFlag = alive;
+    runJob ("separate", [this, aliveFlag, gen, src, opts, restoring]
+    {
+        auto keepGoing = [this, aliveFlag, gen] { return aliveFlag->load() && generation.load() == gen; };
+        auto result = VocalSeparator::separate (*src, opts, [this] (float p) { progress = p; }, keepGoing);
+
+        juce::MessageManager::callAsync ([this, aliveFlag, gen, result, opts, restoring]
+        {
+            if (! aliveFlag->load() || generation.load() != gen) return;
+            busy = false;
+            if (result.vocals == nullptr)
+            {
+                if (restoring) view = View::Original;
+                setStatus ("Separation failed: " + result.error, true);
+                if (restoring) startFrameAnalysis (false);
+                return;
+            }
+            vocals = result.vocals;
+            vocalsMethodId = VocalSeparator::methodId (opts);
+            vocalsLabel = VocalSeparator::methodLabel (opts);
+            pendingVocalsMethod.clear();
+            if (! restoring) view = View::Vocals;
+            publishPlayback();
+            frames.reset();
+            updateStateCache();
+            setStatus ("Vocals isolated with " + vocalsLabel + (result.fromCache ? " (cached)" : ""));
+            // re-analyse on the isolated vocals: fresh separation re-detects fragments
+            startFrameAnalysis (! restoring);
+        });
+    });
+}
+
+//==============================================================================
+void Session::setSort (Sort s)
+{
+    sort = s;
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::setSearchText (const juce::String& text)
+{
+    searchText = text.trim();
+    search = SearchQuery::parse (searchText);
+    if (! search.isEmpty()) sort = Sort::Match;
+    else if (sort == Sort::Match) sort = Sort::Time;
+    updateStateCache();
+    sendChangeMessage();
+}
+
+float Session::sortValue (int index) const
+{
+    if (index < 0 || index >= (int) fragments.size()) return 0.0f;
+    const auto& f = fragments[(size_t) index];
+    switch (sort)
+    {
+        case Sort::Time:   return 0.0f;
+        case Sort::Match:  return search.match (f);
+        default:           return f.scores[(int) sort - 1];
+    }
+}
+
+std::vector<int> Session::getDisplayOrder() const
+{
+    std::vector<int> order ((size_t) fragments.size());
+    std::iota (order.begin(), order.end(), 0);
+    if (sort != Sort::Time)
+        std::stable_sort (order.begin(), order.end(), [this] (int a, int b) { return sortValue (a) > sortValue (b); });
+    return order;
 }
 
 } // namespace ghostcut

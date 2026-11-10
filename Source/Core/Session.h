@@ -3,6 +3,8 @@
 #include "Fragment.h"
 #include "SourceSnapshot.h"
 #include "../Analysis/PhraseSegmenter.h"
+#include "../Analysis/VocalSeparator.h"
+#include "../Analysis/SearchQuery.h"
 #include "../Audio/AudioImporter.h"
 #include "../Audio/AudioExporter.h"
 #include "../Audio/SamplerEngine.h"
@@ -36,12 +38,27 @@ public:
     void relocateMissingSource (const juce::File& f);   // keeps saved fragments
     void trimToSelection();
     bool hasSource() const noexcept { return snapshot != nullptr; }
-    SnapshotPtr getSnapshot() const noexcept { return snapshot; }
+    /** The audio currently shown / played: isolated vocals when the VOCALS view is on. */
+    SnapshotPtr getSnapshot() const noexcept { return view == View::Vocals && vocals != nullptr ? vocals : snapshot; }
+    SnapshotPtr getOriginalSnapshot() const noexcept { return snapshot; }
+
+    // ---- vocal separation ----
+    enum class View { Original = 0, Vocals = 1 };
+    void separate();                                     // runs the selected method (cache first)
+    bool hasVocals() const noexcept { return vocals != nullptr; }
+    View getView() const noexcept { return view; }
+    void setView (View v);
+    VocalSeparator::Options getSeparationOptions() const { return sepOptions; }
+    void setSeparationOptions (const VocalSeparator::Options& o) { sepOptions = o; updateStateCache(); sendChangeMessage(); }
+    juce::String getVocalsLabel() const { return vocalsLabel; }
     juce::File getMissingSource() const { return missingSource; }
     AudioImporter& getImporter() noexcept { return importer; }
 
     // ---- analysis ----
     void analyze();
+    using Granularity = PhraseSegmenter::Settings::Granularity;
+    Granularity getGranularity() const noexcept { return granularity; }
+    void setGranularity (Granularity g) { granularity = g; updateStateCache(); }
     float getSensitivity() const noexcept { return sensitivity; }
     void setSensitivity (float s) { sensitivity = juce::jlimit (0.0f, 1.0f, s); updateStateCache(); }
 
@@ -55,6 +72,17 @@ public:
     void clearFragments();
     int  addFragmentFromSelection();                    // returns new index or -1
     void auditionFragment (int index);
+
+    // ---- ranking + search ----
+    enum class Sort { Time = 0, Ethereal, Haunted, Nostalgic, Heavenly, Experimental, Match };
+    Sort getSort() const noexcept { return sort; }
+    void setSort (Sort s);
+    void setSearchText (const juce::String& text);
+    juce::String getSearchText() const { return searchText; }
+    const SearchQuery& getSearch() const noexcept { return search; }
+    /** Fragment indices in display order (sorted by the current sort / search). */
+    std::vector<int> getDisplayOrder() const;
+    float sortValue (int index) const;
 
     // ---- waveform selection / transport ----
     int64_t getSelectionStart() const noexcept { return selStart; }
@@ -90,6 +118,9 @@ private:
     void startLoad (const juce::File& f, int64_t trimStart, int64_t trimEnd, bool autoAnalyze,
                     std::vector<Fragment> keepFragments, const juce::String& expectedHash);
     void startFrameAnalysis (bool segmentAfter);
+    void startSeparation (bool silentIfMissingCache);
+    SnapshotPtr analysisSnapshot() const { return vocals != nullptr ? vocals : snapshot; }
+    void publishPlayback();
     void sortAndPublish (int64_t keepSelectedUid);
     void publishTable();
     void updateStateCache();
@@ -102,7 +133,14 @@ private:
     AudioImporter importer;
     juce::ThreadPool worker { juce::ThreadPoolOptions{}.withThreadName ("GHOSTCUT worker").withNumberOfThreads (1) };
 
-    SnapshotPtr snapshot;
+    SnapshotPtr snapshot, vocals;
+    View view = View::Original;
+    VocalSeparator::Options sepOptions;
+    juce::String vocalsLabel, vocalsMethodId, pendingVocalsMethod;
+    Granularity granularity = Granularity::Phrases;
+    Sort sort = Sort::Time;
+    juce::String searchText;
+    SearchQuery search;
     std::shared_ptr<const FrameFeatures> frames;
     std::vector<Fragment> fragments;
     int selectedIndex = -1;

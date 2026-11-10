@@ -1,5 +1,6 @@
 #include "FragmentBrowser.h"
 #include "GhostLookAndFeel.h"
+#include "../Analysis/FragmentRanker.h"
 
 namespace ghostcut
 {
@@ -9,6 +10,14 @@ static juce::String formatTime (double seconds)
     const int m = (int) (seconds / 60.0);
     const double s = seconds - m * 60.0;
     return juce::String (m) + ":" + (s < 10.0 ? "0" : "") + juce::String (s, 2);
+}
+
+void drawScoreBar (juce::Graphics& g, juce::Rectangle<float> r, float v, juce::Colour c)
+{
+    g.setColour (colours::line);
+    g.fillRect (r);
+    g.setColour (c);
+    g.fillRect (r.withWidth (r.getWidth() * juce::jlimit (0.0f, 1.0f, v)));
 }
 
 static void drawMiniWave (juce::Graphics& g, juce::Rectangle<float> r, const SourceSnapshot& snap, int64_t s0, int64_t s1, juce::Colour c)
@@ -42,21 +51,30 @@ static void drawMiniWave (juce::Graphics& g, juce::Rectangle<float> r, const Sou
     }
 }
 
+static juce::String sortHeading (Session::Sort s)
+{
+    if (s == Session::Sort::Time)  return {};
+    if (s == Session::Sort::Match) return "MATCH";
+    return FragmentScores::name ((int) s - 1);
+}
+
 //==============================================================================
 class FragmentList::Row : public juce::Component
 {
 public:
     explicit Row (FragmentList& o) : owner (o) {}
-    int row = -1;
+    int fragIndex = -1;
     bool selected = false;
 
     void paint (juce::Graphics& g) override
     {
         const auto& frs = owner.session.getFragments();
         auto snap = owner.session.getSnapshot();
-        if (row < 0 || row >= (int) frs.size()) return;
-        const auto& f = frs[(size_t) row];
-        const bool on = row < 64 && ((owner.engine.getSoundingMask() >> row) & 1u);
+        if (fragIndex < 0 || fragIndex >= (int) frs.size()) return;
+        const int i = fragIndex;
+        const auto& f = frs[(size_t) i];
+        const bool on = i < 64 && ((owner.engine.getSoundingMask() >> i) & 1u);
+        const auto sort = owner.session.getSort();
 
         auto r = getLocalBounds().toFloat();
         g.setColour (selected ? colours::panelHi : colours::panel);
@@ -68,24 +86,43 @@ public:
         auto area = getLocalBounds().reduced (8, 0);
         g.setFont (GhostLookAndFeel::mono (11.0f));
         g.setColour (on ? colours::accent : colours::text);
-        g.drawText (juce::String (row + 1).paddedLeft ('0', 2), area.removeFromLeft (26), juce::Justification::centredLeft);
+        g.drawText (juce::String (i + 1).paddedLeft ('0', 2) + (f.manual ? "*" : ""), area.removeFromLeft (30), juce::Justification::centredLeft);
 
         g.setColour (colours::textDim);
-        const juce::String key = owner.isSlices() ? noteName (owner.getBaseNote() + row) : "--";
-        g.drawText (key, area.removeFromLeft (40), juce::Justification::centredLeft);
-
+        g.drawText (owner.isSlices() ? noteName (owner.getBaseNote() + i) : "--", area.removeFromLeft (38), juce::Justification::centredLeft);
         if (snap != nullptr)
         {
-            g.drawText (formatTime ((double) f.start / snap->sampleRate), area.removeFromLeft (62), juce::Justification::centredLeft);
-            g.drawText (juce::String ((double) f.length() / snap->sampleRate, 2) + "s", area.removeFromLeft (52), juce::Justification::centredLeft);
+            g.drawText (formatTime ((double) f.start / snap->sampleRate), area.removeFromLeft (58), juce::Justification::centredLeft);
+            g.drawText (juce::String ((double) f.length() / snap->sampleRate, 2) + "s", area.removeFromLeft (48), juce::Justification::centredLeft);
         }
         const int root = f.effectiveRoot (-1);
         g.setColour (f.rootOverride >= 0 ? colours::accent : colours::textDim);
-        g.drawText (root >= 0 ? noteName (root) : "--", area.removeFromLeft (40), juce::Justification::centredLeft);
-        g.setColour (colours::textDim);
-        g.drawText (juce::String (juce::roundToInt (f.features.voicedRatio * 100)) + "%v", area.removeFromLeft (46), juce::Justification::centredLeft);
-        if (f.manual) { g.setColour (colours::textFaint); g.drawText ("MAN", area.removeFromLeft (32), juce::Justification::centredLeft); }
-        else area.removeFromLeft (32);
+        g.drawText (root >= 0 ? noteName (root) : "--", area.removeFromLeft (38), juce::Justification::centredLeft);
+
+        // sort value (score or match)
+        auto valueCol = area.removeFromLeft (62);
+        if (sort != Session::Sort::Time)
+        {
+            const float v = owner.session.sortValue (i);
+            drawScoreBar (g, valueCol.toFloat().withSizeKeepingCentre (30, 3).withX ((float) valueCol.getX()), v, colours::accent);
+            g.setColour (colours::text);
+            g.drawText (juce::String (juce::roundToInt (v * 100)), valueCol.withTrimmedLeft (34), juce::Justification::centredLeft);
+        }
+
+        // character: five stacked mini bars E H N Hv X
+        auto ch = area.removeFromLeft (64).toFloat().reduced (0.0f, 6.0f);
+        const float bw = (ch.getWidth() - 8.0f) / 5.0f;
+        for (int k = 0; k < FragmentScores::numKinds; ++k)
+        {
+            auto col = juce::Rectangle<float> (ch.getX() + k * (bw + 2.0f), ch.getY(), bw, ch.getHeight());
+            g.setColour (colours::line);
+            g.fillRect (col);
+            const float v = f.measured ? f.scores[k] : 0.0f;
+            const bool hl = sort != Session::Sort::Time && sort != Session::Sort::Match && (int) sort - 1 == k;
+            g.setColour (hl ? colours::accent : colours::fragment.brighter (0.3f));
+            g.fillRect (col.withTop (col.getBottom() - col.getHeight() * v));
+        }
+        area.removeFromLeft (8);
 
         if (snap != nullptr && area.getWidth() > 30)
             drawMiniWave (g, area.toFloat().reduced (2.0f, 5.0f), *snap, f.start, f.end,
@@ -95,8 +132,8 @@ public:
     void mouseDown (const juce::MouseEvent&) override
     {
         dragged = false;
-        owner.session.selectFragment (row);
-        owner.session.auditionFragment (row);
+        owner.session.selectFragment (fragIndex);
+        owner.session.auditionFragment (fragIndex);
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -104,7 +141,7 @@ public:
         if (dragged || e.getDistanceFromDragStart() < 8) return;
         dragged = true;
         juce::String err;
-        auto file = owner.session.renderFragmentForDrag (row, err);
+        auto file = owner.session.renderFragmentForDrag (fragIndex, err);
         if (file.existsAsFile())
             juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, this);
     }
@@ -123,6 +160,7 @@ FragmentList::FragmentList (Session& s, SamplerEngine& e, std::function<int()> b
     list.setOutlineThickness (0);
     addAndMakeVisible (list);
     session.addChangeListener (this);
+    order = session.getDisplayOrder();
 }
 
 FragmentList::~FragmentList() { session.removeChangeListener (this); }
@@ -133,9 +171,9 @@ void FragmentList::paint (juce::Graphics& g)
     auto header = getLocalBounds().removeFromTop (22).reduced (8, 0);
     g.setColour (colours::textFaint);
     g.setFont (GhostLookAndFeel::label (9.5f, true));
-    auto col = [&] (const char* t, int w) { g.drawText (t, header.removeFromLeft (w), juce::Justification::centredLeft); };
-    col ("#", 26); col ("KEY", 40); col ("TIME", 62); col ("LEN", 52); col ("ROOT", 40); col ("VOICED", 46); col ("", 32);
-    col ("FRAGMENTS", 120);
+    auto col = [&] (const juce::String& t, int w) { g.drawText (t, header.removeFromLeft (w), juce::Justification::centredLeft); };
+    col ("#", 30); col ("KEY", 38); col ("TIME", 58); col ("LEN", 48); col ("ROOT", 38);
+    col (sortHeading (session.getSort()), 62); col ("E H N Hv X", 72);
 
     if (session.getFragments().empty())
     {
@@ -148,26 +186,41 @@ void FragmentList::paint (juce::Graphics& g)
 }
 
 void FragmentList::resized() { list.setBounds (getLocalBounds().withTrimmedTop (22)); }
-void FragmentList::refresh() { list.updateContent(); list.repaint(); }
 
-int FragmentList::getNumRows() { return (int) session.getFragments().size(); }
+void FragmentList::refresh()
+{
+    order = session.getDisplayOrder();
+    list.updateContent();
+    list.repaint();
+    repaint();
+}
+
+int FragmentList::getNumRows() { return (int) order.size(); }
 
 juce::Component* FragmentList::refreshComponentForRow (int row, bool, juce::Component* existing)
 {
     auto* r = dynamic_cast<Row*> (existing);
     if (r == nullptr) { delete existing; r = new Row (*this); }
-    r->row = row;
-    r->selected = row == session.getSelectedIndex();
-    r->setVisible (row < getNumRows());
+    r->fragIndex = row >= 0 && row < (int) order.size() ? order[(size_t) row] : -1;
+    r->selected = r->fragIndex >= 0 && r->fragIndex == session.getSelectedIndex();
+    r->setVisible (r->fragIndex >= 0);
     r->repaint();
     return r;
 }
 
 void FragmentList::changeListenerCallback (juce::ChangeBroadcaster*)
 {
+    order = session.getDisplayOrder();
     list.updateContent();
-    const int sel = session.getSelectedIndex();
-    if (sel >= 0) list.scrollToEnsureRowIsOnscreen (sel);
+    // a new ranking (sort or search) starts at the top; otherwise keep the selection visible
+    const auto rankKey = juce::String ((int) session.getSort()) + "|" + session.getSearchText();
+    if (rankKey != lastRankKey) { lastRankKey = rankKey; list.scrollToEnsureRowIsOnscreen (0); }
+    else
+    {
+        const int sel = session.getSelectedIndex();
+        for (int row = 0; row < (int) order.size(); ++row)
+            if (order[(size_t) row] == sel) { list.scrollToEnsureRowIsOnscreen (row); break; }
+    }
     list.repaint();
     repaint();
 }
@@ -183,8 +236,6 @@ public:
         g.setColour (isEnabled() ? colours::panelHi : colours::panel);
         g.fillRoundedRectangle (r, 2.0f);
         g.setColour (colours::line);
-        float dashes[] = { 3.0f, 3.0f };
-        g.drawDashedLine ({ r.getX() + 4, r.getY() + 1, r.getRight() - 4, r.getY() + 1 }, dashes, 2);
         g.drawRoundedRectangle (r, 2.0f, 1.0f);
         g.setColour (isEnabled() ? colours::text : colours::textFaint);
         GhostLookAndFeel::drawTracked (g, "DRAG TO DAW", r, GhostLookAndFeel::label (11.0f, true), 0.12f, juce::Justification::centred);
@@ -222,6 +273,7 @@ FragmentInspector::FragmentInspector (Session& s) : session (s)
 
     audition.onClick = [this] { session.auditionFragment (session.getSelectedIndex()); };
     exportBtn.onClick = [this] { exportSelected(); };
+    exportBtn.setTooltip ("Exports what you hear: the original, or the isolated vocals when VOCALS is on.");
     del.onClick = [this] { session.deleteFragment (session.getSelectedIndex()); };
 
     session.addChangeListener (this);
@@ -249,12 +301,13 @@ void FragmentInspector::update()
 
 void FragmentInspector::exportSelected()
 {
-    auto snap = session.getSnapshot();
+    auto snap = session.getOriginalSnapshot();
     const int i = session.getSelectedIndex();
     if (snap == nullptr || i < 0) return;
     const auto& f = session.getFragments()[(size_t) i];
-    auto def = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
-                   .getChildFile (AudioExporter::makeFragmentFileName (*snap, i + 1, f.start));
+    auto name = AudioExporter::makeFragmentFileName (*snap, i + 1, f.start);
+    if (session.getView() == Session::View::Vocals) name = name.replace (".wav", "_vocals.wav");
+    auto def = juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile (name);
     chooser = std::make_unique<juce::FileChooser> ("Export fragment", def, "*.wav");
     chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
                           [this, i] (const juce::FileChooser& fc)
@@ -291,29 +344,67 @@ void FragmentInspector::paint (juce::Graphics& g)
                                    r.removeFromTop (26).withTrimmedRight (rootBox.getWidth() + 8).toFloat(),
                                    GhostLookAndFeel::label (18.0f, true), 0.08f, juce::Justification::centredLeft);
     r.removeFromTop (4);
+    r.removeFromBottom (28 + 6 + 28 + 6);
+
+    auto left = r.removeFromLeft (r.getWidth() * 55 / 100);
+    r.removeFromLeft (10);
+    auto right = r;
 
     auto line = [&] (const juce::String& k, const juce::String& v)
     {
-        auto row = r.removeFromTop (15);
+        auto row = left.removeFromTop (15);
         g.setColour (colours::textFaint);
-        g.setFont (GhostLookAndFeel::label (10.0f, true));
-        g.drawText (k, row.removeFromLeft (96), juce::Justification::centredLeft);
+        g.setFont (GhostLookAndFeel::label (9.5f, true));
+        g.drawText (k, row.removeFromLeft (64), juce::Justification::centredLeft);
         g.setColour (colours::text);
-        g.setFont (GhostLookAndFeel::mono (11.0f));
-        g.drawText (v, row, juce::Justification::centredLeft);
+        g.setFont (GhostLookAndFeel::mono (10.5f));
+        g.drawText (v, row, juce::Justification::centredLeft, true);
     };
     const auto& ft = f.features;
-    line ("START", formatTime ((double) f.start / snap->sampleRate));
-    line ("LENGTH", juce::String ((double) f.length() / snap->sampleRate, 3) + " s");
-    line ("PITCH", ft.medianF0Hz > 0 ? juce::String (ft.medianF0Hz, 1) + " Hz  " + noteName (f.detectedNote) : "no stable pitch");
-    line ("PITCH SPREAD", ft.medianF0Hz > 0 ? juce::String (ft.pitchStabilitySemis, 2) + " st" : "--");
-    line ("VOICED", juce::String (juce::roundToInt (ft.voicedRatio * 100)) + " %");
-    line ("LEVEL", juce::String (ft.meanDb, 1) + " dB avg / " + juce::String (ft.peakDb, 1) + " pk");
-    line ("BRIGHTNESS", juce::String (juce::roundToInt (ft.centroidHz)) + " Hz centroid");
+    const bool pitched = ft.medianF0Hz > 0;
+    line ("START", formatTime ((double) f.start / snap->sampleRate) + "   " + juce::String (ft.durationSec > 0 ? ft.durationSec : (double) f.length() / snap->sampleRate, 2) + " s");
+    line ("PITCH", pitched ? juce::String (ft.medianF0Hz, 1) + " Hz  " + noteName (f.detectedNote) : "no stable pitch");
+    line ("CONTOUR", pitched ? "range " + juce::String (ft.pitchRangeSemis, 1) + "st  slope " + juce::String (ft.pitchSlope, 1) + "st/s" : "--");
+    line ("BEND", pitched ? juce::String (ft.bendSemis, 1) + " st glide, " + juce::String (ft.jumpsPerSec, 1) + " jumps/s" : "--");
+    line ("HELD", juce::String (ft.sustainSec, 2) + " s longest note");
+    line ("VIBRATO", ft.vibratoRateHz > 0 ? juce::String (ft.vibratoRateHz, 1) + " Hz, " + juce::String (ft.vibratoDepthSemis, 2) + " st" : "none");
+    line ("VOICE", juce::String (juce::roundToInt (ft.voicedRatio * 100)) + "% voiced, harm " + juce::String (ft.harmonicity, 2));
+    line ("BREATH", juce::String (ft.breathiness, 2) + " (heur.)  air " + juce::String (juce::roundToInt (ft.airiness * 100)) + "%");
+    line ("TONE", juce::String (juce::roundToInt (ft.centroidHz)) + " Hz centroid, " + juce::String (ft.meanDb, 1) + " dB");
+    line ("ENVELOPE", "attack " + juce::String (juce::roundToInt (ft.attackSec * 1000)) + " ms, tail " + juce::String (juce::roundToInt (ft.decaySec * 1000)) + " ms");
 
+    // scores
     g.setColour (colours::textFaint);
-    g.setFont (GhostLookAndFeel::label (9.5f));
-    g.drawText ("Measurements only. Character scores arrive in Phase 2.", r.removeFromTop (14), juce::Justification::centredLeft);
+    g.setFont (GhostLookAndFeel::label (9.5f, true));
+    g.drawText ("CHARACTER  (heuristic)", right.removeFromTop (15), juce::Justification::centredLeft);
+    int best = 0;
+    for (int k = 1; k < FragmentScores::numKinds; ++k) if (f.scores[k] > f.scores[best]) best = k;
+    for (int k = 0; k < FragmentScores::numKinds; ++k)
+    {
+        auto row = right.removeFromTop (17);
+        g.setColour (k == best ? colours::text : colours::textDim);
+        g.setFont (GhostLookAndFeel::label (9.5f, true));
+        g.drawText (FragmentScores::name (k), row.removeFromLeft (84), juce::Justification::centredLeft);
+        auto val = row.removeFromRight (24);
+        drawScoreBar (g, row.toFloat().withSizeKeepingCentre ((float) row.getWidth(), 3.0f), f.measured ? f.scores[k] : 0.0f,
+                      k == best ? colours::accent : colours::fragment.brighter (0.4f));
+        g.setFont (GhostLookAndFeel::mono (10.0f));
+        g.drawText (f.measured ? juce::String (juce::roundToInt (f.scores[k] * 100)) : "--", val, juce::Justification::centredRight);
+    }
+    right.removeFromTop (4);
+    if (f.measured)
+    {
+        g.setColour (colours::textDim);
+        g.setFont (GhostLookAndFeel::label (10.0f));
+        g.drawFittedText ("Most " + juce::String (FragmentScores::name (best)).toLowerCase() + ": "
+                              + FragmentRanker::explain (f, best), right.removeFromTop (30), juce::Justification::topLeft, 2);
+    }
+    else
+    {
+        g.setColour (colours::textFaint);
+        g.setFont (GhostLookAndFeel::label (10.0f));
+        g.drawText ("Measuring...", right.removeFromTop (15), juce::Justification::centredLeft);
+    }
 }
 
 void FragmentInspector::resized()
@@ -326,7 +417,6 @@ void FragmentInspector::resized()
     del.setBounds (bottom);
     r.removeFromBottom (6);
     dragHandle->setBounds (r.removeFromBottom (28));
-    // root note picker sits top-right, level with the fragment heading
     rootBox.setBounds (r.withTrimmedTop (14).removeFromTop (24).removeFromRight (std::min (120, r.getWidth() / 2)));
 }
 

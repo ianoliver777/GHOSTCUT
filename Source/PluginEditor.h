@@ -23,11 +23,17 @@ public:
     ~SettingsPanel() override;
     void paint (juce::Graphics&) override;
     void resized() override;
+    void visibilityChanged() override { refreshMethods(); }
 private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
+    void refreshMethods();
     ghostcut::Session& session;
-    juce::ComboBox bitDepth;
-    juce::TextButton openFolder { "Open drag folder" };
+    juce::ComboBox bitDepth, method;
+    juce::TextButton openFolder { "Open drag folder" }, installModel { "Install model..." },
+                     openModels { "Open models folder" }, clearCache { "Clear stem cache" };
+    juce::Array<ghostcut::VocalModelInfo> models;
+    std::unique_ptr<juce::FileChooser> chooser;
+    juce::Rectangle<int> sepTextArea, storageArea, aboutArea;
 };
 
 class GhostcutEditor final : public juce::AudioProcessorEditor,

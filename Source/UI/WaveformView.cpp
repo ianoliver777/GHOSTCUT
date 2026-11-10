@@ -107,9 +107,11 @@ void WaveformView::zoomToSelection()
 void WaveformView::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     auto snap = session.getSnapshot();
-    if (snap.get() != shownSnapshot)
+    // only reset the view for a new source, not when switching ORIGINAL / VOCALS
+    auto original = session.getOriginalSnapshot();
+    if (original.get() != shownSnapshot)
     {
-        shownSnapshot = snap.get();
+        shownSnapshot = original.get();
         cursor = 0;
         zoomToFit();
     }
@@ -167,6 +169,13 @@ void WaveformView::paint (juce::Graphics& g)
 
     const auto& snap = *snapPtr;
     drawRuler (g, getLocalBounds().removeFromTop (rulerHeight), snap);
+    if (session.getView() == Session::View::Vocals && session.hasVocals())
+    {
+        g.setColour (colours::accent.withAlpha (0.8f));
+        GhostLookAndFeel::drawTracked (g, "ISOLATED VOCALS: " + session.getVocalsLabel().toUpperCase(),
+                                       wave.reduced (8, 6).toFloat(), GhostLookAndFeel::label (9.5f, true), 0.15f,
+                                       juce::Justification::topRight);
+    }
 
     // selected fragment tint
     const auto& frs = session.getFragments();

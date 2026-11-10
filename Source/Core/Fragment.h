@@ -18,6 +18,37 @@ struct FragmentFeatures
     float meanDb              = -100.0f;
     float peakDb              = -100.0f;
     float centroidHz          = 0.0f;  // mean spectral centroid (brightness proxy)
+
+    // Phase 2 measurements (FeatureExtractor). Pitch values are in semitones.
+    float durationSec       = 0.0f;
+    float pitchRangeSemis   = 0.0f;  // 5th..95th percentile of the smoothed contour
+    float pitchSlope        = 0.0f;  // semitones / second, linear fit (negative = descending)
+    float bendSemis         = 0.0f;  // largest pitch glide within 200 ms
+    float sustainSec        = 0.0f;  // longest held note (pitch within +-0.75 st)
+    float vibratoRateHz     = 0.0f;  // 0 = none detected
+    float vibratoDepthSemis = 0.0f;
+    float harmonicity       = 0.0f;  // mean periodicity of voiced frames, 0..1
+    float breathiness       = 0.0f;  // HEURISTIC 0..1: aperiodicity + high-band noise flatness
+    float airiness          = 0.0f;  // energy share above 5 kHz, 0..1
+    float attackSec         = 0.0f;  // start -> within 3 dB of peak
+    float decaySec          = 0.0f;  // last near-peak frame -> end
+    float jumpsPerSec       = 0.0f;  // pitch jumps > 2.5 st between neighbouring voiced frames
+    float fluxMean          = 0.0f;  // spectral change, 0..1
+};
+
+/** Labelled HEURISTIC character scores (0..1) built from FragmentFeatures.
+    They describe measurable sound qualities associated with each word; they are
+    not emotion detection. Formulas: Analysis/FragmentRanker.cpp. */
+struct FragmentScores
+{
+    enum Kind { Ethereal = 0, Haunted, Nostalgic, Heavenly, Experimental, numKinds };
+    float value[numKinds] {};
+    float operator[] (int k) const noexcept { return value[k]; }
+    static const char* name (int k) noexcept
+    {
+        static const char* names[] = { "ETHEREAL", "HAUNTED", "NOSTALGIC", "HEAVENLY", "EXPERIMENTAL" };
+        return (k >= 0 && k < numKinds) ? names[k] : "";
+    }
 };
 
 /** One vocal fragment: a region of the current source, in source-sample units. */
@@ -32,6 +63,8 @@ struct Fragment
     int rootOverride = -1; // user override, -1 = use detected
 
     FragmentFeatures features;
+    FragmentScores scores;
+    bool measured = false;    // features computed from the current analysis audio
 
     int64_t length() const noexcept { return end - start; }
 

@@ -43,6 +43,45 @@ DiscoverPanel::DiscoverPanel (Session& s, SamplerEngine& e, juce::AudioProcessor
     sensitivity.onDragEnd = [this] { if (session.hasSource() && ! session.isBusy()) session.analyze(); };
     addAndMakeVisible (sensitivity);
 
+    granularity.addItem ("Phrases", 1);
+    granularity.addItem ("Syllables", 2);
+    granularity.setSelectedId ((int) session.getGranularity() + 1, juce::dontSendNotification);
+    granularity.setTooltip ("PHRASES: whole sung lines. SYLLABLES: chop at note / syllable onsets.");
+    granularity.onChange = [this]
+    {
+        session.setGranularity ((Session::Granularity) (granularity.getSelectedId() - 1));
+        if (session.hasSource() && ! session.isBusy()) session.analyze();
+    };
+    addAndMakeVisible (granularity);
+
+    separateBtn.setTooltip ("Isolate the vocals (method chosen in SETTINGS), then re-detect fragments on them.");
+    separateBtn.onClick = [this] { session.separate(); };
+    viewOriginal.setTooltip ("Hear / export the original recording.");
+    viewVocals.setTooltip ("Hear / export the isolated vocals. Fragments are shared between both.");
+    viewOriginal.onClick = [this] { session.setView (Session::View::Original); };
+    viewVocals.onClick = [this] { session.setView (Session::View::Vocals); };
+    for (auto* b : { &separateBtn, &viewOriginal, &viewVocals }) addAndMakeVisible (b);
+
+    searchBox.setTextToShowWhenEmpty ("Search: e.g. airy high-pitched sustained vowel / short ghostly, good for reversing", colours::textFaint);
+    searchBox.setColour (juce::TextEditor::backgroundColourId, colours::panelHi);
+    searchBox.setColour (juce::TextEditor::outlineColourId, colours::line);
+    searchBox.setColour (juce::TextEditor::focusedOutlineColourId, colours::textDim);
+    searchBox.setColour (juce::TextEditor::textColourId, colours::text);
+    searchBox.setFont (GhostLookAndFeel::label (13.0f));
+    searchBox.setText (session.getSearchText(), false);
+    searchBox.onReturnKey = [this] { session.setSearchText (searchBox.getText()); };
+    searchBox.onTextChange = [this] { session.setSearchText (searchBox.getText()); repaint (searchInfoArea); };
+    searchBox.onEscapeKey = [this] { searchBox.clear(); session.setSearchText ({}); grabKeyboardFocus(); };
+    addAndMakeVisible (searchBox);
+
+    sortBox.addItem ("Sort: Time", 1);
+    for (int k = 0; k < FragmentScores::numKinds; ++k)
+        sortBox.addItem ("Sort: " + juce::String (FragmentScores::name (k)), k + 2);
+    sortBox.addItem ("Sort: Match", 7);
+    sortBox.setSelectedId ((int) session.getSort() + 1, juce::dontSendNotification);
+    sortBox.onChange = [this] { session.setSort ((Session::Sort) (sortBox.getSelectedId() - 1)); };
+    addAndMakeVisible (sortBox);
+
     playBtn.onClick = [this] { session.playFrom (waveform.getCursor()); };
     stopBtn.onClick = [this] { session.stop(); };
     loopBtn.setClickingTogglesState (false);
@@ -109,6 +148,10 @@ void DiscoverPanel::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     updateButtons();
     sensitivity.setValue (session.getSensitivity(), juce::dontSendNotification);
+    granularity.setSelectedId ((int) session.getGranularity() + 1, juce::dontSendNotification);
+    sortBox.setSelectedId ((int) session.getSort() + 1, juce::dontSendNotification);
+    if (! searchBox.hasKeyboardFocus (true) && searchBox.getText() != session.getSearchText())
+        searchBox.setText (session.getSearchText(), false);
     resized(); // LOCATE button may have appeared / disappeared
     repaint();
 }
@@ -127,6 +170,14 @@ void DiscoverPanel::updateButtons()
     for (auto* b : { &analyzeBtn, &playBtn, &stopBtn, &loopBtn, &zoomOut, &zoomIn, &zoomFit })
         b->setEnabled (src);
     analyzeBtn.setEnabled (src && ! session.isBusy());
+    separateBtn.setEnabled (src && ! session.isBusy());
+    viewOriginal.setEnabled (src);
+    viewVocals.setEnabled (session.hasVocals());
+    viewOriginal.setToggleState (session.getView() == Session::View::Original || ! session.hasVocals(), juce::dontSendNotification);
+    viewVocals.setToggleState (session.getView() == Session::View::Vocals && session.hasVocals(), juce::dontSendNotification);
+    separateBtn.setButtonText (session.hasVocals() ? "Re-separate" : "Separate");
+    sortBox.setEnabled (! session.getFragments().empty());
+    sortBox.setItemEnabled (7, ! session.getSearch().isEmpty());
     clearBtn.setEnabled (! session.getFragments().empty());
     zoomSel.setEnabled (src && sel);
     trimBtn.setEnabled (src && sel && ! session.isBusy());
@@ -138,11 +189,21 @@ bool DiscoverPanel::keyPressed (const juce::KeyPress& k)
 {
     if (k == juce::KeyPress::spaceKey) { session.togglePlay (waveform.getCursor()); return true; }
     if (k == juce::KeyPress::deleteKey || k == juce::KeyPress::backspaceKey) { session.deleteFragment (session.getSelectedIndex()); return true; }
-    const int sel = session.getSelectedIndex();
-    const int n = (int) session.getFragments().size();
-    if (k == juce::KeyPress::downKey && n > 0) { const int i = juce::jmin (n - 1, sel + 1); session.selectFragment (i); session.auditionFragment (i); return true; }
-    if (k == juce::KeyPress::upKey && n > 0)   { const int i = juce::jmax (0, sel - 1);     session.selectFragment (i); session.auditionFragment (i); return true; }
+    if (k == juce::KeyPress::downKey) { stepSelection (1); return true; }
+    if (k == juce::KeyPress::upKey)   { stepSelection (-1); return true; }
+    if (k == juce::KeyPress ('f', juce::ModifierKeys::commandModifier, 0)) { searchBox.grabKeyboardFocus(); return true; }
     return false;
+}
+
+void DiscoverPanel::stepSelection (int delta)
+{
+    const auto& order = list.getOrder();
+    if (order.empty()) return;
+    int pos = -1;
+    for (int r = 0; r < (int) order.size(); ++r) if (order[(size_t) r] == session.getSelectedIndex()) pos = r;
+    pos = juce::jlimit (0, (int) order.size() - 1, pos < 0 ? 0 : pos + delta);
+    session.selectFragment (order[(size_t) pos]);
+    session.auditionFragment (order[(size_t) pos]);
 }
 
 void DiscoverPanel::paint (juce::Graphics& g)
@@ -162,6 +223,18 @@ void DiscoverPanel::paint (juce::Graphics& g)
         g.setFont (GhostLookAndFeel::mono (11.0f));
         g.drawText ("SEL " + juce::String (a, 3) + " - " + juce::String (b, 3) + " s  (" + juce::String (b - a, 3) + " s)",
                     transportArea.withTrimmedLeft (transportArea.getWidth() - 300), juce::Justification::centredRight);
+    }
+
+    // what the search understood (and what it ignored) — keyword mapping, not AI
+    {
+        const auto& q = session.getSearch();
+        juce::StringArray parts;
+        for (auto& c : q.constraints) parts.add (c.label);
+        juce::String text = parts.isEmpty() ? juce::String() : "LOOKING FOR: " + parts.joinIntoString ("  /  ");
+        if (! q.ignoredWords.isEmpty()) text += (text.isEmpty() ? "" : "     ") + juce::String ("IGNORED: ") + q.ignoredWords.joinIntoString (", ");
+        g.setColour (q.ignoredWords.isEmpty() ? colours::textDim : colours::warn);
+        g.setFont (GhostLookAndFeel::label (10.0f));
+        g.drawText (text, searchInfoArea, juce::Justification::centredLeft, true);
     }
 
     // instrument controls strip
@@ -192,10 +265,15 @@ void DiscoverPanel::resized()
     if (locateBtn.isVisible()) { locateBtn.setBounds (tb.removeFromLeft (84)); tb.removeFromLeft (6); }
     else locateBtn.setBounds (tb.getX(), tb.getY(), 84, tb.getHeight());
     tb.removeFromLeft (14);
-    analyzeBtn.setBounds (tb.removeFromLeft (84)); tb.removeFromLeft (10);
-    sensitivity.setBounds (tb.removeFromLeft (150).withTrimmedTop (10));
+    analyzeBtn.setBounds (tb.removeFromLeft (80)); tb.removeFromLeft (6);
+    granularity.setBounds (tb.removeFromLeft (100)); tb.removeFromLeft (10);
+    sensitivity.setBounds (tb.removeFromLeft (120).withTrimmedTop (10));
     tb.removeFromLeft (10);
-    clearBtn.setBounds (tb.removeFromLeft (64));
+    clearBtn.setBounds (tb.removeFromLeft (58));
+    // separation group, right-aligned
+    viewVocals.setBounds (tb.removeFromRight (74)); tb.removeFromRight (2);
+    viewOriginal.setBounds (tb.removeFromRight (74)); tb.removeFromRight (8);
+    separateBtn.setBounds (tb.removeFromRight (100));
 
     // instrument controls at the bottom
     controlsArea = r.removeFromBottom (100);
@@ -215,10 +293,15 @@ void DiscoverPanel::resized()
     }
 
     // fragment browser + inspector
-    auto browser = r.removeFromBottom (juce::jlimit (262, 380, (int) (r.getHeight() * 0.48f)));
+    auto browser = r.removeFromBottom (juce::jlimit (300, 420, (int) (r.getHeight() * 0.52f)));
     browser = browser.reduced (pad, 0).withTrimmedBottom (pad);
-    inspector.setBounds (browser.removeFromRight (juce::jlimit (260, 360, browser.getWidth() / 3)));
+    inspector.setBounds (browser.removeFromRight (juce::jlimit (400, 520, browser.getWidth() * 2 / 5)));
     browser.removeFromRight (8);
+    auto searchRow = browser.removeFromTop (28);
+    sortBox.setBounds (searchRow.removeFromRight (150));
+    searchRow.removeFromRight (6);
+    searchBox.setBounds (searchRow);
+    searchInfoArea = browser.removeFromTop (18).withTrimmedLeft (2);
     list.setBounds (browser);
 
     // transport row

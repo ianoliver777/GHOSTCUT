@@ -1,4 +1,6 @@
 #include "PhraseSegmenter.h"
+#include "FeatureExtractor.h"
+#include "FragmentRanker.h"
 #include <juce_dsp/juce_dsp.h>
 #include <algorithm>
 #include <numeric>
@@ -156,6 +158,10 @@ FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const P
     ff.centroid.resize ((size_t) numFrames);
     ff.f0.resize ((size_t) numFrames);
     ff.clarity.resize ((size_t) numFrames);
+    ff.hfRatio.resize ((size_t) numFrames);
+    ff.flatness.resize ((size_t) numFrames);
+    const int hfBin = (int) std::ceil (5000.0 * fftSize / sr);
+    const int flatLo = (int) std::ceil (2000.0 * fftSize / sr), flatHi = std::min (fftSize / 2, (int) (8000.0 * fftSize / sr));
 
     std::vector<float> fftBuf ((size_t) fftSize * 2);
     std::vector<float> prevMag ((size_t) fftSize / 2 + 1, 0.0f);
@@ -196,6 +202,17 @@ FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const P
             weighted += m * (k * sr / fftSize);
             prevMag[(size_t) k] = m;
         }
+        double pTot = 0.0, pHf = 0.0, logSum = 0.0, linSum = 0.0;
+        for (int k = 1; k <= fftSize / 2; ++k)
+        {
+            const double pw = (double) fftBuf[(size_t) k] * fftBuf[(size_t) k];
+            pTot += pw;
+            if (k >= hfBin) pHf += pw;
+            if (k >= flatLo && k < flatHi) { logSum += std::log (pw + 1e-20); linSum += pw; }
+        }
+        ff.hfRatio[(size_t) f] = pTot > 1e-18 ? (float) (pHf / pTot) : 0.0f;
+        const int nFlat = std::max (1, flatHi - flatLo);
+        ff.flatness[(size_t) f] = linSum > 1e-18 ? (float) juce::jlimit (0.0, 1.0, std::exp (logSum / nFlat) / (linSum / nFlat)) : 0.0f;
         ff.flux[(size_t) f] = magSum > 1e-9 ? (float) (fluxSum / (magSum + 1e-9)) : 0.0f;
         ff.centroid[(size_t) f] = magSum > 1e-9 ? (float) (weighted / magSum) : 0.0f;
 
@@ -221,46 +238,8 @@ FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const P
 
 void PhraseSegmenter::measure (Fragment& frag, const SourceSnapshot& src, const FrameFeatures& ff)
 {
-    FragmentFeatures out;
-    const int nf = ff.numFrames();
-    if (nf == 0 || frag.length() <= 0) { frag.features = out; frag.detectedNote = -1; return; }
-
-    const double hopSamples = ff.hopSeconds * src.sampleRate;
-    const int f0i = juce::jlimit (0, nf - 1, (int) std::floor (frag.start / hopSamples));
-    const int f1i = juce::jlimit (f0i + 1, nf, (int) std::ceil (frag.end / hopSamples));
-
-    std::vector<float> voicedHz;
-    double dbSum = 0.0, cent = 0.0;
-    float peak = -100.0f;
-    int counted = 0;
-    for (int f = f0i; f < f1i; ++f)
-    {
-        dbSum += ff.db[(size_t) f];
-        peak = std::max (peak, ff.db[(size_t) f]);
-        cent += ff.centroid[(size_t) f];
-        ++counted;
-        if (ff.f0[(size_t) f] > 0.0f) voicedHz.push_back (ff.f0[(size_t) f]);
-    }
-    out.meanDb = counted > 0 ? (float) (dbSum / counted) : -100.0f;
-    out.peakDb = peak;
-    out.centroidHz = counted > 0 ? (float) (cent / counted) : 0.0f;
-    out.voicedRatio = counted > 0 ? (float) voicedHz.size() / (float) counted : 0.0f;
-
-    if (voicedHz.size() >= 3)
-    {
-        out.medianF0Hz = percentile (voicedHz, 0.5f);
-        double mean = 0.0, sq = 0.0;
-        for (float hz : voicedHz)
-        {
-            const double st = 12.0 * std::log2 (hz / out.medianF0Hz);
-            mean += st; sq += st * st;
-        }
-        mean /= (double) voicedHz.size();
-        out.pitchStabilitySemis = (float) std::sqrt (std::max (0.0, sq / (double) voicedHz.size() - mean * mean));
-    }
-
-    frag.features = out;
-    frag.detectedNote = out.medianF0Hz > 0.0f && out.voicedRatio >= 0.2f ? frequencyToMidiNote (out.medianF0Hz) : -1;
+    FeatureExtractor::measure (frag, src, ff);
+    FragmentRanker::score (frag);
 }
 
 std::vector<Fragment> PhraseSegmenter::segment (const SourceSnapshot& src, const FrameFeatures& ff,
@@ -337,12 +316,52 @@ std::vector<Fragment> PhraseSegmenter::segment (const SourceSnapshot& src, const
     };
     for (auto sp : merged) splitRec (sp);
 
-    const int minF = msToFrames (s.minLengthMs);
+    if (s.granularity == Settings::Granularity::Syllables)
+    {
+        // Split phrases into syllable-sized chops at: level dips >= 5 dB, voicing
+        // restarting after >= 40 ms unvoiced, or strong spectral-flux onsets.
+        const int minSyl = msToFrames (120.0f);
+        const int unvoicedGap = msToFrames (40.0f);
+        std::vector<Span> syl;
+        for (auto sp : split)
+        {
+            int segStart = sp.a, unv = 0;
+            float runMax = lvl[(size_t) sp.a];
+            double fluxMean = 0.0;
+            for (int f = sp.a; f < sp.b; ++f) fluxMean += ff.flux[(size_t) f];
+            fluxMean /= std::max (1, sp.b - sp.a);
+
+            for (int f = sp.a + 1; f < sp.b - minSyl; ++f)
+            {
+                runMax = std::max (runMax, lvl[(size_t) f]);
+                const bool voiced = ff.f0[(size_t) f] > 0.0f;
+                const bool voiceRestart = voiced && unv >= unvoicedGap;
+                unv = voiced ? 0 : unv + 1;
+
+                const bool localMin = lvl[(size_t) f] <= lvl[(size_t) f - 1] && lvl[(size_t) f] <= lvl[(size_t) f + 1];
+                const bool dip = localMin && runMax - lvl[(size_t) f] >= 5.0f;
+                const bool onset = ff.flux[(size_t) f] > 3.0 * fluxMean && ff.flux[(size_t) f] > ff.flux[(size_t) f - 1];
+
+                if ((dip || voiceRestart || onset) && f - segStart >= minSyl)
+                {
+                    syl.push_back ({ segStart, f });
+                    segStart = f;
+                    runMax = lvl[(size_t) f];
+                }
+            }
+            syl.push_back ({ segStart, sp.b });
+        }
+        split = std::move (syl);
+    }
+
+    const bool syllables = s.granularity == Settings::Granularity::Syllables;
+    const int minF = msToFrames (syllables ? std::min (s.minLengthMs, 120.0f) : s.minLengthMs);
     const double hopSamples = hop * src.sampleRate;
     const int64_t pre  = (int64_t) (s.preRollMs / 1000.0 * src.sampleRate);
-    const int64_t tail = (int64_t) (s.tailMs / 1000.0 * src.sampleRate);
+    const int64_t tail = (int64_t) ((syllables ? std::min (s.tailMs, 30.0f) : s.tailMs) / 1000.0 * src.sampleRate);
     int64_t uid = 1;
 
+    std::vector<Fragment> cands;
     for (auto sp : split)
     {
         if (sp.b - sp.a < minF) continue;
@@ -350,7 +369,14 @@ std::vector<Fragment> PhraseSegmenter::segment (const SourceSnapshot& src, const
         fr.uid = uid++;
         fr.start = std::max<int64_t> (0, (int64_t) (sp.a * hopSamples) - pre);
         fr.end   = std::min<int64_t> (src.numSamples(), (int64_t) (sp.b * hopSamples) + tail);
-        if (! result.empty() && fr.start < result.back().end) fr.start = result.back().end; // no overlap
+        cands.push_back (fr);
+    }
+    // no overlaps: a tail never runs into the next fragment's start
+    for (size_t i = 0; i + 1 < cands.size(); ++i)
+        cands[i].end = std::min (cands[i].end, cands[i + 1].start);
+
+    for (auto& fr : cands)
+    {
         if (fr.length() <= 0) continue;
         measure (fr, src, ff);
         if (fr.features.voicedRatio < s.minVoicedRatio) continue;
