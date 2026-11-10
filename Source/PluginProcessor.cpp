@@ -33,6 +33,7 @@ void GhostcutProcessor::timerCallback()
 
 GhostcutProcessor::~GhostcutProcessor()
 {
+    alive->store (false);
     stopTimer();
 }
 
@@ -116,6 +117,14 @@ void GhostcutProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
     chain.process (buffer, fx->fx(), engine.getLastBpm());
 }
 
+void GhostcutProcessor::setCurrentProgram (int index)
+{
+    if (index < 0 || index >= presets.numFactory()) return;
+    currentProgram = index;
+    // hosts may call this from any thread; parameters + generation settings change on the message thread
+    juce::MessageManager::callAsync ([this, index, a = alive] { if (a->load()) presets.loadFactory (index); });
+}
+
 juce::AudioProcessorEditor* GhostcutProcessor::createEditor()
 {
     return new GhostcutEditor (*this);
@@ -134,6 +143,9 @@ void GhostcutProcessor::getStateInformation (juce::MemoryBlock& destData)
     juce::ValueTree root ("GHOSTCUT");
     root.setProperty ("version", 1, nullptr);
     root.setProperty ("pluginVersion", JucePlugin_VersionString, nullptr);
+    root.setProperty ("presetName", presets.getCurrentName(), nullptr);
+    root.setProperty ("presetId", presets.getCurrentId(), nullptr);
+    root.setProperty ("program", currentProgram, nullptr);
     root.appendChild (apvts.copyState(), nullptr);
     root.appendChild (session.getStateTree(), nullptr);
 
@@ -149,6 +161,11 @@ void GhostcutProcessor::setStateInformation (const void* data, int sizeInBytes)
     const auto root = juce::ValueTree::fromXml (*xml);
     if (! root.hasType ("GHOSTCUT")) return;
 
+    currentProgram = (int) root.getProperty ("program", 0);
+    {
+        const auto name = root.getProperty ("presetName", "Init").toString(), id = root.getProperty ("presetId").toString();
+        juce::MessageManager::callAsync ([this, name, id, a = alive] { if (a->load()) presets.setCurrent (name, id); });
+    }
     const auto params = root.getChildWithName (apvts.state.getType());
     if (params.isValid()) apvts.replaceState (params);
 

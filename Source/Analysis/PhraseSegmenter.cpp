@@ -126,6 +126,42 @@ namespace
     }
 }
 
+bool FrameFeatures::save (const juce::File& f) const
+{
+    juce::MemoryOutputStream mo;
+    mo.writeInt (0x47434646); // 'GCFF'
+    mo.writeInt (formatVersion);
+    mo.writeDouble (hopSeconds);
+    mo.writeInt (numFrames());
+    auto put = [&mo] (const std::vector<float>& v) { mo.writeInt ((int) v.size()); mo.write (v.data(), v.size() * sizeof (float)); };
+    for (auto* v : { &db, &flux, &centroid, &f0, &clarity, &hfRatio, &flatness, &bands }) put (*v);
+    f.getParentDirectory().createDirectory();
+    return f.replaceWithData (mo.getData(), mo.getDataSize());
+}
+
+bool FrameFeatures::load (const juce::File& f, FrameFeatures& out)
+{
+    juce::MemoryBlock mb;
+    if (! f.loadFileAsData (mb)) return false;
+    juce::MemoryInputStream in (mb, false);
+    if (in.readInt() != 0x47434646 || in.readInt() != formatVersion) return false;
+    FrameFeatures ff;
+    ff.hopSeconds = in.readDouble();
+    const int n = in.readInt();
+    auto get = [&in] (std::vector<float>& v)
+    {
+        const int len = in.readInt();
+        if (len < 0 || (size_t) len * sizeof (float) > (size_t) in.getNumBytesRemaining()) return false;
+        v.resize ((size_t) len);
+        return in.read (v.data(), len * (int) sizeof (float)) == len * (int) sizeof (float);
+    };
+    for (auto* v : { &ff.db, &ff.flux, &ff.centroid, &ff.f0, &ff.clarity, &ff.hfRatio, &ff.flatness, &ff.bands })
+        if (! get (*v)) return false;
+    if (ff.numFrames() != n || ff.bands.size() != (size_t) n * numBands) return false;
+    out = std::move (ff);
+    return true;
+}
+
 FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const Progress& progress,
                                               const ShouldContinue& keepGoing)
 {
@@ -162,6 +198,10 @@ FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const P
     ff.flatness.resize ((size_t) numFrames);
     const int hfBin = (int) std::ceil (5000.0 * fftSize / sr);
     const int flatLo = (int) std::ceil (2000.0 * fftSize / sr), flatHi = std::min (fftSize / 2, (int) (8000.0 * fftSize / sr));
+    ff.bands.assign ((size_t) numFrames * FrameFeatures::numBands, -100.0f);
+    std::array<int, FrameFeatures::numBands + 1> bandEdge {};
+    for (int b = 0; b <= FrameFeatures::numBands; ++b)
+        bandEdge[(size_t) b] = std::clamp ((int) std::lround (100.0 * std::pow (100.0, (double) b / FrameFeatures::numBands) * fftSize / sr), 1, fftSize / 2);
 
     std::vector<float> fftBuf ((size_t) fftSize * 2);
     std::vector<float> prevMag ((size_t) fftSize / 2 + 1, 0.0f);
@@ -211,6 +251,13 @@ FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const P
             if (k >= flatLo && k < flatHi) { logSum += std::log (pw + 1e-20); linSum += pw; }
         }
         ff.hfRatio[(size_t) f] = pTot > 1e-18 ? (float) (pHf / pTot) : 0.0f;
+        for (int b = 0; b < FrameFeatures::numBands; ++b)
+        {
+            double be = 0.0;
+            for (int k = bandEdge[(size_t) b]; k < std::max (bandEdge[(size_t) b] + 1, bandEdge[(size_t) b + 1]); ++k)
+                be += (double) fftBuf[(size_t) k] * fftBuf[(size_t) k];
+            ff.bands[(size_t) f * FrameFeatures::numBands + (size_t) b] = (float) (10.0 * std::log10 (be + 1e-12));
+        }
         const int nFlat = std::max (1, flatHi - flatLo);
         ff.flatness[(size_t) f] = linSum > 1e-18 ? (float) juce::jlimit (0.0, 1.0, std::exp (logSum / nFlat) / (linSum / nFlat)) : 0.0f;
         ff.flux[(size_t) f] = magSum > 1e-9 ? (float) (fluxSum / (magSum + 1e-9)) : 0.0f;
@@ -230,6 +277,28 @@ FrameFeatures PhraseSegmenter::computeFrames (const SourceSnapshot& src, const P
         const bool voiced = hz > 0.0f && ap < 0.25f;
         ff.f0[(size_t) f] = voiced ? hz : 0.0f;
         ff.clarity[(size_t) f] = juce::jlimit (0.0f, 1.0f, 1.0f - ap);
+    }
+
+    // ---- pitch track clean-up ------------------------------------------------
+    // 1) drop isolated single voiced frames (usually consonant noise)
+    for (int f = 1; f + 1 < numFrames; ++f)
+        if (ff.f0[(size_t) f] > 0 && ff.f0[(size_t) f - 1] <= 0 && ff.f0[(size_t) f + 1] <= 0) ff.f0[(size_t) f] = 0;
+    // 2) octave errors: fold frames that sit ~an octave away from the local median
+    {
+        std::vector<float> st ((size_t) numFrames, 0.0f), win;
+        for (int f = 0; f < numFrames; ++f) st[(size_t) f] = ff.f0[(size_t) f] > 0 ? (float) (12.0 * std::log2 (ff.f0[(size_t) f] / 440.0)) : 0.0f;
+        for (int f = 0; f < numFrames; ++f)
+        {
+            if (ff.f0[(size_t) f] <= 0) continue;
+            win.clear();
+            for (int k = std::max (0, f - 15); k <= std::min (numFrames - 1, f + 15); ++k) if (ff.f0[(size_t) k] > 0) win.push_back (st[(size_t) k]);
+            if (win.size() < 5) continue;
+            std::nth_element (win.begin(), win.begin() + (long) win.size() / 2, win.end());
+            const float med = win[win.size() / 2];
+            const float d = st[(size_t) f] - med;
+            if (std::abs (std::abs (d) - 12.0f) < 2.0f)
+                ff.f0[(size_t) f] *= d > 0 ? 0.5f : 2.0f;
+        }
     }
 
     if (progress) progress (1.0f);

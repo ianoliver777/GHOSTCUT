@@ -17,8 +17,15 @@ struct FrameFeatures
     std::vector<float> clarity;   // 1 - YIN aperiodicity, 0..1
     std::vector<float> hfRatio;   // energy share above 5 kHz
     std::vector<float> flatness;  // spectral flatness 2-8 kHz (noise-likeness), 0..1
+    static constexpr int numBands = 12;
+    std::vector<float> bands;     // numFrames * numBands log-band energies (dB), 100 Hz - 10 kHz: spectral envelope
     double hopSeconds = 0.01;
     int numFrames() const noexcept { return (int) db.size(); }
+
+    /** Disk cache (binary, versioned). Bump `formatVersion` whenever analysis changes. */
+    static constexpr int formatVersion = 3;
+    bool save (const juce::File&) const;
+    static bool load (const juce::File&, FrameFeatures& out);
 };
 
 /**

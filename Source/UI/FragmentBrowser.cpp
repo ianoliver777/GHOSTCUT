@@ -55,6 +55,7 @@ static juce::String sortHeading (Session::Sort s)
 {
     if (s == Session::Sort::Time)  return {};
     if (s == Session::Sort::Match) return "MATCH";
+    if (s == Session::Sort::Ghost) return "GHOST";
     return FragmentScores::name ((int) s - 1);
 }
 
@@ -409,6 +410,19 @@ void FragmentInspector::paint (juce::Graphics& g)
         g.setColour (colours::textFaint);
         g.setFont (GhostLookAndFeel::label (10.0f));
         g.drawText ("Measuring...", right.removeFromTop (15), juce::Justification::centredLeft);
+    }
+
+    if (session.hasReference())
+    {
+        const auto m = session.getGhostMatch (i);
+        right.removeFromTop (4);
+        g.setColour (colours::accent);
+        g.setFont (GhostLookAndFeel::label (10.0f, true));
+        g.drawText ("GHOST MATCH " + juce::String (juce::roundToInt (m.total * 100)) + "%  (feature similarity)", right.removeFromTop (14),
+                    juce::Justification::centredLeft);
+        g.setColour (colours::textDim);
+        g.setFont (GhostLookAndFeel::label (9.5f));
+        g.drawFittedText (m.describe(), right.removeFromTop (28), juce::Justification::topLeft, 2);
     }
 }
 

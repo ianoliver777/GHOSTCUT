@@ -4,6 +4,7 @@
 #include "Audio/SamplerEngine.h"
 #include "Core/Session.h"
 #include "FxParameters.h"
+#include "Presets/PresetManager.h"
 
 namespace ghostcut::param
 {
@@ -41,10 +42,10 @@ public:
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return fx != nullptr ? chain.tailSeconds (fx->fx()) : 0.0; }
 
-    int getNumPrograms() override { return 1; }
-    int getCurrentProgram() override { return 0; }
-    void setCurrentProgram (int) override {}
-    const juce::String getProgramName (int) override { return "Default"; }
+    int getNumPrograms() override { return presets.numFactory(); }
+    int getCurrentProgram() override { return currentProgram; }
+    void setCurrentProgram (int index) override;
+    const juce::String getProgramName (int index) override { return presets.factoryName (index); }
     void changeProgramName (int, const juce::String&) override {}
 
     void getStateInformation (juce::MemoryBlock& destData) override;
@@ -53,6 +54,7 @@ public:
     juce::AudioProcessorValueTreeState& getParameters() noexcept { return apvts; }
     ghostcut::Session& getSession() noexcept { return session; }
     ghostcut::SamplerEngine& getEngine() noexcept { return engine; }
+    ghostcut::PresetManager& getPresets() noexcept { return presets; }
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 
@@ -62,6 +64,9 @@ private:
     ghostcut::SamplerEngine engine;
     juce::AudioProcessorValueTreeState apvts;
     ghostcut::Session session { engine };
+    ghostcut::PresetManager presets { apvts, session };
+    int currentProgram = 0;
+    std::shared_ptr<std::atomic<bool>> alive = std::make_shared<std::atomic<bool>> (true);
 
     std::atomic<float>* pGain = nullptr;
     std::atomic<float>* pAttack = nullptr;

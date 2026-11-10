@@ -5,6 +5,8 @@
 #include "../Analysis/PhraseSegmenter.h"
 #include "../Analysis/VocalSeparator.h"
 #include "../Analysis/SearchQuery.h"
+#include "../Analysis/ReferenceMatcher.h"
+#include "../Analysis/QueryInterpreter.h"
 #include "../Generation/PatternGenerator.h"
 #include "../Generation/PatternExport.h"
 #include "../DSP/Effects.h"
@@ -78,7 +80,7 @@ public:
     void auditionFragment (int index);
 
     // ---- ranking + search ----
-    enum class Sort { Time = 0, Ethereal, Haunted, Nostalgic, Heavenly, Experimental, Match };
+    enum class Sort { Time = 0, Ethereal, Haunted, Nostalgic, Heavenly, Experimental, Match, Ghost };
     Sort getSort() const noexcept { return sort; }
     void setSort (Sort s);
     void setSearchText (const juce::String& text);
@@ -87,6 +89,17 @@ public:
     /** Fragment indices in display order (sorted by the current sort / search). */
     std::vector<int> getDisplayOrder() const;
     float sortValue (int index) const;
+
+    // ---- GHOST MATCH ----
+    void setReferenceFile (const juce::File& f);         // analysed on the worker thread
+    void clearReference();
+    bool hasReference() const noexcept { return reference.valid; }
+    juce::File getReferenceFile() const { return referenceFile; }
+    const ReferenceMatcher::Signature& getReferenceSignature() const noexcept { return reference; }
+    /** Similarity of fragment i to the reference (valid when hasReference()). */
+    ReferenceMatcher::Match getGhostMatch (int index) const;
+    /** Similarity of fragment i to fragment j (used by "like #12" searches). */
+    float fragmentSimilarity (int i, int j) const;
 
     // ---- generation (GENERATE / SEQUENCE) ----
     static constexpr int numPatternSlots = 8;
@@ -155,6 +168,7 @@ private:
                     std::vector<Fragment> keepFragments, const juce::String& expectedHash);
     void startFrameAnalysis (bool segmentAfter);
     void renderPatternAsync();
+    void rebuildSignatures();
     void timerCallback() override;
     void startSeparation (bool silentIfMissingCache);
     SnapshotPtr analysisSnapshot() const { return vocals != nullptr ? vocals : snapshot; }
@@ -187,6 +201,10 @@ private:
     std::shared_ptr<const RenderedPattern> rendered;
     double renderedBpm = 0.0;
     RenderOptions renderOptions;
+    ReferenceMatcher::Signature reference;
+    juce::File referenceFile;
+    std::vector<ReferenceMatcher::Signature> signatures;   // per fragment, from the analysis audio
+    std::unique_ptr<QueryInterpreter> interpreter = std::make_unique<KeywordInterpreter>();
     bool renderingPattern = false;
     std::atomic<int> patternGeneration { 0 };
     std::shared_ptr<const FrameFeatures> frames;

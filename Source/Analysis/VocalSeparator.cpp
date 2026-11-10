@@ -116,13 +116,13 @@ juce::File VocalSeparator::cacheFileFor (const SourceSnapshot& s, const Options&
 juce::int64 VocalSeparator::getCacheSizeBytes()
 {
     juce::int64 total = 0;
-    for (auto& f : getCacheFolder().findChildFiles (juce::File::findFiles, false, "*.wav")) total += f.getSize();
+    for (auto& f : getCacheFolder().findChildFiles (juce::File::findFiles, false, "*.wav;*.gcff")) total += f.getSize();
     return total;
 }
 
 void VocalSeparator::clearCache()
 {
-    for (auto& f : getCacheFolder().findChildFiles (juce::File::findFiles, false, "*.wav")) f.deleteFile();
+    for (auto& f : getCacheFolder().findChildFiles (juce::File::findFiles, false, "*.wav;*.gcff")) f.deleteFile();
 }
 
 //==============================================================================
@@ -152,7 +152,7 @@ juce::AudioBuffer<float> VocalSeparator::resample (const juce::AudioBuffer<float
         const double r = x / halfWidth;
         const double w = r < 1.0 ? bessel0 (beta * std::sqrt (1.0 - r * r)) / i0b : 0.0;
         const double arg = juce::MathConstants<double>::pi * x * cutoff;
-        table[(size_t) i] = (float) (cutoff * (x == 0.0 ? 1.0 : std::sin (arg) / arg) * w);
+        table[(size_t) i] = (float) (cutoff * (x < 1.0e-12 ? 1.0 : std::sin (arg) / arg) * w);
     }
 
     for (int ch = 0; ch < in.getNumChannels(); ++ch)
@@ -347,6 +347,7 @@ VocalSeparator::Result VocalSeparator::separate (const SourceSnapshot& src, cons
             juce::AudioBuffer<float> a ((int) rd->numChannels, (int) rd->lengthInSamples);
             rd->read (&a, 0, a.getNumSamples(), 0, true, true);
             r.vocals = makeLike (src, std::move (a));
+            r.vocals->variant = methodId (opt);
             r.fromCache = true;
             if (progress) progress (1.0f);
             return r;
@@ -404,6 +405,7 @@ VocalSeparator::Result VocalSeparator::separate (const SourceSnapshot& src, cons
     }
 
     r.vocals = makeLike (src, std::move (out));
+    r.vocals->variant = methodId (opt);
     if (progress) progress (1.0f);
     return r;
 }

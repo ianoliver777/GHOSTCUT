@@ -97,6 +97,7 @@ SearchQuery SearchQuery::parse (const juce::String& raw)
                .replace ("long note", "sustained").replace ("held note", "sustained").replace ("long tail", "longtail")
                .replace ("long decay", "longtail").replace ("-", " ");
     juce::StringArray tok;
+    text = text.replace ("#", " #").replace ("  ", " ");
     tok.addTokens (text, " ", "");
     tok.removeEmptyStrings();
     for (auto& t : tok) if (t.endsWithChar ('.')) t = t.dropLastCharacters (1);
@@ -108,9 +109,11 @@ SearchQuery SearchQuery::parse (const juce::String& raw)
         "pitch", "pitched", "movement", "melody", "line", "texture", "piece", "part", "than", "around", "about" };
 
     bool negate = false;
+    float emphasis = 1.0f;   // "very airy" counts double
     auto add = [&] (juce::String label, Feature f, float lo, float hi, float w = 1.0f)
     {
         if (negate) { std::swap (lo, hi); label = "not " + label; }
+        if (emphasis > 1.0f) { w *= emphasis; label = "very " + label; }
         for (auto& c : q.constraints) if (c.feature == f && c.label == label) return; // de-dup
         q.constraints.push_back ({ label, f, lo, hi, w });
     };
@@ -122,6 +125,21 @@ SearchQuery SearchQuery::parse (const juce::String& raw)
         const auto prev = i > 0 ? tok[i - 1] : juce::String();
 
         if (t == "not" || t == "no" || t == "without" || t == "non") { negate = true; continue; }
+        if (t == "very" || t == "really" || t == "super" || t == "extremely") { emphasis = 2.0f; continue; }
+
+        // "like 12", "like #12", "similar to 12": rank by similarity to that fragment
+        if ((t == "like" || t == "similar") && i + 1 < tok.size())
+        {
+            int j = i + 1;
+            if (tok[j] == "to" && j + 1 < tok.size()) ++j;
+            if (tok[j] == "fragment" && j + 1 < tok.size()) ++j;
+            const auto num = tok[j].trimCharactersAtStart ("#");
+            if (num.containsOnly ("0123456789") && num.isNotEmpty())
+            {
+                q.likeFragment = num.getIntValue();
+                i = j; continue;
+            }
+        }
 
         // comparisons: "under 2 seconds", "longer than 1s", "above a4", "below c3", "around e4"
         const bool less = t == "under" || t == "below" || t == "shorter" || t == "less" || t == "max";
@@ -212,8 +230,59 @@ SearchQuery SearchQuery::parse (const juce::String& raw)
 
         if (! matched && ! stop.contains (t) && t.containsAnyOf ("abcdefghijklmnopqrstuvwxyz"))
             q.ignoredWords.addIfNotAlreadyThere (t);
-        if (matched || ! stop.contains (t)) negate = false;
+        if (matched || ! stop.contains (t)) { negate = false; emphasis = 1.0f; }
     }
+    return q;
+}
+
+//==============================================================================
+static const char* featureKey (SearchQuery::Feature f)
+{
+    static const char* keys[] = { "note", "duration", "sustain", "breathiness", "airiness", "attack", "decay", "slope", "bend",
+                                  "range", "vibrato", "centroid", "level", "stability", "harmonicity", "jumps", "voiced",
+                                  "score_ethereal", "score_haunted", "score_nostalgic", "score_heavenly", "score_experimental" };
+    return keys[(int) f];
+}
+
+juce::var SearchQuery::toJson() const
+{
+    juce::Array<juce::var> cs;
+    for (auto& c : constraints)
+    {
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("feature", featureKey (c.feature));
+        o->setProperty ("label", c.label);
+        o->setProperty ("from", c.lo);
+        o->setProperty ("to", c.hi);
+        o->setProperty ("weight", c.weight);
+        o->setProperty ("band", c.band);
+        cs.add (juce::var (o));
+    }
+    auto* root = new juce::DynamicObject();
+    root->setProperty ("constraints", cs);
+    root->setProperty ("like_fragment", likeFragment);
+    return juce::var (root);
+}
+
+SearchQuery SearchQuery::fromJson (const juce::var& json, juce::String& error)
+{
+    SearchQuery q;
+    const auto* arr = json.getProperty ("constraints", juce::var()).getArray();
+    if (arr == nullptr) { error = "missing 'constraints' array"; return q; }
+    for (auto& c : *arr)
+    {
+        const auto key = c.getProperty ("feature", "").toString();
+        int found = -1;
+        for (int k = 0; k <= (int) Feature::ScoreExperimental; ++k) if (key == featureKey ((Feature) k)) found = k;
+        if (found < 0) { error = "unknown feature '" + key + "'"; return {}; }
+        const float lo = (float) c.getProperty ("from", 0.0), hi = (float) c.getProperty ("to", 1.0);
+        if (! std::isfinite (lo) || ! std::isfinite (hi) || juce::exactlyEqual (lo, hi)) { error = "bad range for '" + key + "'"; return {}; }
+        Constraint con { c.getProperty ("label", key).toString(), (Feature) found, lo, hi,
+                         juce::jlimit (0.1f, 4.0f, (float) c.getProperty ("weight", 1.0)) };
+        con.band = (bool) c.getProperty ("band", false);
+        q.constraints.push_back (con);
+    }
+    q.likeFragment = (int) json.getProperty ("like_fragment", -1);
     return q;
 }
 

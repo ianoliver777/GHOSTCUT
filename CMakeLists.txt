@@ -107,6 +107,9 @@ set(GHOSTCUT_CORE_SOURCES
     Source/Analysis/FragmentRanker.cpp
     Source/Analysis/SearchQuery.h
     Source/Analysis/SearchQuery.cpp
+    Source/Analysis/QueryInterpreter.h
+    Source/Analysis/ReferenceMatcher.h
+    Source/Analysis/ReferenceMatcher.cpp
     Source/Analysis/Stft.h
     Source/Analysis/Stft.cpp
     Source/Analysis/OnnxRuntime.h
@@ -144,7 +147,9 @@ set(GHOSTCUT_UI_SOURCES
     Source/UI/SequencePanel.h
     Source/UI/SequencePanel.cpp
     Source/UI/EffectsPanel.h
-    Source/UI/EffectsPanel.cpp)
+    Source/UI/EffectsPanel.cpp
+    Source/UI/PresetBar.h
+    Source/UI/PresetBar.cpp)
 
 set(GHOSTCUT_COMMON_DEFINITIONS
     JUCE_WEB_BROWSER=0
@@ -186,6 +191,8 @@ target_sources(GHOSTCUT PRIVATE
     Source/PluginEditor.cpp
     Source/FxParameters.h
     Source/FxParameters.cpp
+    Source/Presets/PresetManager.h
+    Source/Presets/PresetManager.cpp
     ${GHOSTCUT_CORE_SOURCES}
     ${GHOSTCUT_UI_SOURCES})
 
@@ -217,7 +224,8 @@ target_link_libraries(GHOSTCUT
 # ---------------------------------------------------------------- tests
 if(GHOSTCUT_BUILD_TESTS)
     juce_add_console_app(GhostcutTests PRODUCT_NAME "GhostcutTests")
-    target_sources(GhostcutTests PRIVATE Tests/TestMain.cpp ${GHOSTCUT_CORE_SOURCES})
+    target_sources(GhostcutTests PRIVATE Tests/TestMain.cpp ${GHOSTCUT_CORE_SOURCES}
+        Source/FxParameters.cpp Source/Presets/PresetManager.cpp)
     target_compile_definitions(GhostcutTests PRIVATE ${GHOSTCUT_COMMON_DEFINITIONS}
         JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_UNIT_TESTS=1)
     target_include_directories(GhostcutTests PRIVATE Source ThirdParty/signalsmith-linear/include)
@@ -239,6 +247,7 @@ if(GHOSTCUT_BUILD_TESTS)
             juce::juce_events
             juce::juce_cryptography
             juce::juce_dsp
+            juce::juce_audio_processors
         PUBLIC
             juce::juce_recommended_config_flags
             juce::juce_recommended_warning_flags)

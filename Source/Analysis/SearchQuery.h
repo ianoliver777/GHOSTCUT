@@ -36,12 +36,17 @@ public:
 
     static SearchQuery parse (const juce::String& text);
 
-    bool isEmpty() const noexcept { return constraints.empty(); }
+    bool isEmpty() const noexcept { return constraints.empty() && likeFragment < 0; }
     /** 0..1, mean satisfaction over all constraints. */
     float match (const Fragment& f) const;
 
     std::vector<Constraint> constraints;
     juce::StringArray ignoredWords;
+    int likeFragment = -1;      // "like #12" / "similar to 12": 1-based fragment number, -1 = none
+
+    /** Constraints in JSON, for an optional external interpreter (see OptionalInterpreter.h). */
+    juce::var toJson() const;
+    static SearchQuery fromJson (const juce::var& json, juce::String& error);
 
     static float featureValue (const Fragment& f, Feature feat);
 };

@@ -7,7 +7,7 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 
 ---
 
-## Status: Phase 4 (creative DSP)
+## Status: Phase 5 (advanced features)
 
 | Feature | State |
 |---|---|
@@ -38,9 +38,19 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 | PITCH / FORMANT (semitones, fine, formant, harmony layers) and REVERSE (all chops, transition, reverse step order), rendered offline for best quality | ✅ working |
 | Mode FX presets + "FX follow mode". All ~35 effect controls are automatable | ✅ working |
 | Loop exports include the effects (two-pass render, so tails wrap seamlessly) | ✅ working |
-| GHOST MATCH, preset library | ⏳ Phase 5 |
+| **GHOST MATCH**: rank fragments by similarity to a reference vocal (contour shape via DTW, register, timbre, length, breathiness, rhythm, harmonicity) with a per-feature breakdown | ✅ working |
+| Advanced search: `like #12`, `very airy`, negation, numbers and notes, plus a JSON contract for an optional language-model interpreter (not included, offline keywords stay the default) | ✅ working |
+| **Presets**: 17 factory presets in 6 categories (also exposed as host programs), user presets with categories, save / load / delete / next / prev, recalled with the project | ✅ working |
+| Analysis upgrades: spectral envelope (12 bands), octave-error correction, isolated-frame cleanup, on-disk frame cache (instant re-open) | ✅ working |
+| Shortcuts: ⌘/Ctrl+1–5 pages, ⌘/Ctrl+G generate, ⌘/Ctrl+Shift+G rebuild, ⌘/Ctrl+P play pattern, Space play, ↑/↓ browse, ⌘/Ctrl+F search | ✅ working |
 
 Tabs for unbuilt phases are visible but clearly marked as not built yet.
+
+### Verified in Phase 5
+- GHOST MATCH: self-match 1.00. A same-shaped phrase in another key (0.79) beats an opposite-shaped phrase in the same register (0.71), which beats a short noisy one (0.20). In a session, the matching phrase ranks first, and the reference survives save/restore.
+- Strong 2nd-harmonic tone: 200 voiced frames, 0 octave errors.
+- Presets: factory load sets mode FX and GENERATE settings and never touches your seed. A user preset round-trips exactly; delete works; next/prev walks the list.
+- pluginval strictness 10 passes. It caught an on/off parameter recall bug in this phase: switches are now 2-state choices, so state recall is exact.
 
 ### Verified in Phase 4
 - All effects off = bit-exact passthrough. Toggling every section on/off mid-signal stays click-free (linear 20 ms fades that land exactly on 0/1).
@@ -179,6 +189,26 @@ Each mode also has a matching effects preset (EFFECTS → mode FX, or automatic 
 | HEAVEN | 14 s bright reverb, 1/4 ping-pong, chorus, tilt bright |
 | CHAOS | 1/16T delay at 70% feedback, 9 kHz / 7-bit crush, saturation, flutter |
 
+## GHOST MATCH
+
+Discover → **GHOST MATCH** → pick a reference vocal (any WAV/MP3). GHOSTCUT measures it (and only measures it: the reference is never played, stored or exported) and ranks your fragments by *feature similarity*:
+
+| Feature | How | Weight |
+|---|---|---|
+| Pitch contour shape | semitones relative to its median, 32 points, DTW with a 25% band (key-independent) | 32% |
+| Register | median pitch distance (gentle: chops get re-pitched anyway) | 14% |
+| Timbre | 12-band spectral envelope, level-normalised | 14% |
+| Length | fragment length + average note length | 12% |
+| Breathiness / air | heuristic breathiness + energy above 5 kHz | 12% |
+| Rhythm | onset rate + energy modulation | 9% |
+| Harmonicity | periodicity + voiced share | 7% |
+
+The inspector shows the per-feature breakdown. This is measurable similarity, not a promise that two sounds feel the same.
+
+## Presets
+
+The header bar holds presets: ◀ ▶ step through them, click the name for the categorised menu, and SAVE stores your own. A preset = every parameter (instrument, pattern sync, effects, pitch/formant) + GENERATE settings. It never includes audio, fragments, patterns or your seed. User presets live in `~/Music/TRIPLE SEVEN AUDIO/GHOSTCUT/Presets/<Category>/`. Factory presets also appear in Live's preset/program list.
+
 ## Search: what it understands
 
 Search is **keyword-to-feature mapping, not AI language understanding**. It turns words into measurable targets and always shows what it used and what it ignored:
@@ -200,6 +230,10 @@ Search is **keyword-to-feature mapping, not AI language understanding**. It turn
 | reverse, reversing | long tail + sharp start (reverses into a swell) |
 | `above A3`, `below C4`, `around E4` | register (Ableton note names, C3 = 60) |
 | not / no + word | inverts it (`no vibrato`) |
+| very / really + word | doubles its weight (`very breathy`) |
+| `like #12`, `similar to 12` | similarity to fragment 12 (the GHOST MATCH features) |
+
+**Optional language model (not included):** `Source/Analysis/QueryInterpreter.h` defines how a local or cloud model could translate free text into the same constraint JSON. GHOSTCUT validates that JSON (unknown features are rejected) and shows the constraints like any other search. Keyword search stays the offline default.
 
 ## Character scores (heuristics)
 
@@ -220,11 +254,13 @@ Source/
   Core/        Fragment, SourceSnapshot, AudioThreadExchange (lock-free handoff), Session (model + state)
   Audio/       AudioImporter (decode, peaks, fingerprint), SamplerEngine (voices, MIDI), AudioExporter
   Analysis/    PhraseSegmenter (energy / flux / YIN, phrases + syllables), FeatureExtractor, FragmentRanker,
-               SearchQuery, VocalSeparator (MDX + center extract + cache), OnnxRuntime (dynamic loader), Stft
+               SearchQuery, QueryInterpreter, ReferenceMatcher (GHOST MATCH), VocalSeparator (MDX + center extract + cache),
+               OnnxRuntime (dynamic loader), Stft
   Generation/  Random (PCG32), ScaleQuantizer, Pattern, PatternGenerator (+ mode profiles), ChopRenderer
                (Signalsmith), PatternExport (loop WAV + MIDI)
   DSP/         Biquad / DelayLine / smoothers, Effects (Texture, LoFi, SyncDelay, FdnReverb, EffectsChain)
   FxParameters (effect parameters, readers, mode presets)
+  Presets/     PresetManager (factory table, user files, host programs)
   UI/          + PatternView (roll / lanes editor), GeneratePanel, SequencePanel, EffectsPanel
   UI/          GhostLookAndFeel, WaveformView, FragmentBrowser, DiscoverPanel
   PluginProcessor / PluginEditor
@@ -267,6 +303,7 @@ Planned additions follow the brief: `Analysis/VocalSeparator` (ONNX), `FeatureEx
 
 - The DAW project stores a **reference**, not the audio: the absolute path, the file size, a content fingerprint (FNV-1a over size + first/last 256 KB), and the trim range.
 - Fragments (start/end in samples, manual flag, root override, measured features), selection, loop, sensitivity and export bit depth are stored in the project.
+- Frame analysis is cached in the same folder (`*.gcff`, versioned), so reopening a project skips re-analysis.
 - Isolated vocals are cached on disk in `~/Music/TRIPLE SEVEN AUDIO/GHOSTCUT/Cache` (key: fingerprint + trim + model). A reopened project reloads its vocals from there. If the cache was cleared, separation re-runs automatically (with progress). Frame measurements are recomputed in the background after load (seconds).
 - The project also stores the separation method, the ORIGINAL/VOCALS view, granularity, sort and search text.
 - Missing file → fragments are kept, the reference is kept (re-saving doesn't lose it), and LOCATE or dropping a file with the same name relinks it. A different file at the same path triggers a warning.

@@ -146,7 +146,7 @@ void SettingsPanel::paint (juce::Graphics& g)
     }, colours::textDim);
 
     heading (aboutArea, "ABOUT");
-    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 4 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
+    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 5 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
 }
 
 void SettingsPanel::resized()
@@ -177,6 +177,7 @@ GhostcutEditor::GhostcutEditor (GhostcutProcessor& p)
       generate (p.getSession(), p.getEngine(), p.getParameters()),
       sequence (p.getSession(), p.getEngine()),
       effects (p.getSession(), p.getParameters()),
+      presetBar (p.getPresets()),
       settings (p.getSession())
 {
     setLookAndFeel (&lnf);
@@ -196,6 +197,7 @@ GhostcutEditor::GhostcutEditor (GhostcutProcessor& p)
         addChildComponent (c);
 
     addAndMakeVisible (progress);
+    addAndMakeVisible (presetBar);
     progress.setPercentageDisplay (false);
     session.addChangeListener (this);
 
@@ -302,8 +304,11 @@ void GhostcutEditor::resized()
 
     auto h = headerArea.reduced (16, 0);
     brandArea = h.removeFromLeft (220).reduced (0, 9);
-    auto tabRow = h.withSizeKeepingCentre (std::min (h.getWidth(), 5 * 112), 28);
-    for (auto* t : tabs) { t->setBounds (tabRow.removeFromLeft (108)); tabRow.removeFromLeft (4); }
+    presetBar.setBounds (h.removeFromRight (320).withSizeKeepingCentre (320, 28));
+    h.removeFromRight (12);
+    const int tabW = juce::jlimit (88, 108, (h.getWidth() - 16) / 5 - 4);
+    auto tabRow = h.withSizeKeepingCentre (std::min (h.getWidth(), 5 * (tabW + 4)), 28);
+    for (auto* t : tabs) { t->setBounds (tabRow.removeFromLeft (tabW)); tabRow.removeFromLeft (4); }
 
     progress.setBounds (statusArea.reduced (12, 0).removeFromRight (150).withSizeKeepingCentre (150, 8));
 
@@ -316,6 +321,19 @@ void GhostcutEditor::mouseUp (const juce::MouseEvent& e)
 {
     if (brandArea.contains (e.getPosition()))
         juce::URL ("https://triplesevenaudio.com").launchInDefaultBrowser();
+}
+
+bool GhostcutEditor::keyPressed (const juce::KeyPress& k)
+{
+    // Cmd/Ctrl + 1..5: pages.  Cmd/Ctrl + G: generate (new seed).  Cmd/Ctrl + Shift + G: rebuild same seed.
+    // Cmd/Ctrl + P: play / stop the pattern.
+    const auto cmd = juce::ModifierKeys::commandModifier;
+    for (int i = 0; i < 5; ++i)
+        if (k == juce::KeyPress ('1' + i, cmd, 0)) { showTab (i); return true; }
+    if (k == juce::KeyPress ('g', cmd, 0)) { session.generate (true); return true; }
+    if (k == juce::KeyPress ('g', cmd | juce::ModifierKeys::shiftModifier, 0)) { session.generate (false); return true; }
+    if (k == juce::KeyPress ('p', cmd, 0)) { session.setPatternPlaying (! processor.getEngine().isSequencerRunning()); return true; }
+    return false;
 }
 
 bool GhostcutEditor::isInterestedInFileDrag (const juce::StringArray& files)

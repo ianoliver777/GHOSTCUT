@@ -34,7 +34,10 @@ void addParameters (AudioProcessorValueTreeState::ParameterLayout& l)
         l.add (std::make_unique<AudioParameterFloat> (ParameterID { id, 1 }, name, r, def,
                                                       AudioParameterFloatAttributes().withLabel (unit).withStringFromValueFunction (fmt (unit))));
     };
-    auto b = [&l] (const char* id, const char* name, bool def) { l.add (std::make_unique<AudioParameterBool> (ParameterID { id, 1 }, name, def)); };
+    // On/off switches are 2-state choices: they quantise in setValue(), so state recall is
+    // exact (AudioParameterBool keeps raw values like 0.89 that don't survive save/restore).
+    auto b = [&l] (const char* id, const char* name, bool def)
+    { l.add (std::make_unique<AudioParameterChoice> (ParameterID { id, 1 }, name, StringArray { "Off", "On" }, def ? 1 : 0)); };
 
     b (texOn, "Texture On", false);
     f (texDrive, "Saturation", { 0, 1, 0.01f }, 0.0f);
@@ -127,13 +130,10 @@ float Reader::pitchRatioForKeys() const noexcept
     return std::pow (2.0f, (std::round (pSemi->load()) + pFine->load() / 100.0f) / 12.0f);
 }
 
-void applyModePreset (AudioProcessorValueTreeState& s, GenMode mode)
+ParamValues modePresetValues (GenMode mode)
 {
-    auto set = [&s] (const char* id, float v)
-    {
-        if (auto* p = s.getParameter (id))
-            p->setValueNotifyingHost (p->convertTo0to1 (v));
-    };
+    ParamValues out;
+    auto set = [&out] (const char* id, float v) { out.push_back ({ id, v }); };
     // start from neutral
     for (auto* id : { texOn, lofiOn, dlyOn, revOn }) set (id, 0.0f);
     set (texDrive, 0); set (texNoise, -80); set (texTilt, 0); set (texHp, 20); set (texLp, 20000);
@@ -170,6 +170,14 @@ void applyModePreset (AudioProcessorValueTreeState& s, GenMode mode)
             break;
         case GenMode::numModes: break;
     }
+    return out;
+}
+
+void applyModePreset (AudioProcessorValueTreeState& s, GenMode mode)
+{
+    for (auto& [id, v] : modePresetValues (mode))
+        if (auto* p = s.getParameter (id))
+            p->setValueNotifyingHost (p->convertTo0to1 (v));
 }
 
 } // namespace ghostcut::fxp

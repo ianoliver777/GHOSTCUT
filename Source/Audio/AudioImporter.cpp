@@ -159,6 +159,7 @@ std::shared_ptr<SourceSnapshot> AudioImporter::crop (const SourceSnapshot& src, 
     snap->contentHash = src.contentHash;
     snap->trimStart   = src.trimStart + start;
     snap->trimEnd     = src.trimStart + end;
+    snap->variant     = src.variant;
     snap->peaks.build (snap->audio);
     return snap;
 }

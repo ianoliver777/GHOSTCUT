@@ -78,6 +78,22 @@ DiscoverPanel::DiscoverPanel (Session& s, SamplerEngine& e, juce::AudioProcessor
     for (int k = 0; k < FragmentScores::numKinds; ++k)
         sortBox.addItem ("Sort: " + juce::String (FragmentScores::name (k)), k + 2);
     sortBox.addItem ("Sort: Match", 7);
+    sortBox.addItem ("Sort: Ghost match", 8);
+
+    ghostBtn.setTooltip ("GHOST MATCH: pick a reference vocal. Fragments are ranked by measured similarity "
+                         "(pitch contour, register, timbre, length, breathiness, rhythm). The reference is only measured, never used.");
+    ghostBtn.onClick = [this]
+    {
+        chooser = std::make_unique<juce::FileChooser> ("GHOST MATCH: choose a reference vocal",
+                                                       juce::File::getSpecialLocation (juce::File::userMusicDirectory),
+                                                       session.getImporter().getWildcard());
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                              [this] (const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) session.setReferenceFile (fc.getResult()); });
+    };
+    ghostClear.setTooltip ("Clear the GHOST MATCH reference");
+    ghostClear.onClick = [this] { session.clearReference(); };
+    addAndMakeVisible (ghostBtn);
+    addAndMakeVisible (ghostClear);
     sortBox.setSelectedId ((int) session.getSort() + 1, juce::dontSendNotification);
     sortBox.onChange = [this] { session.setSort ((Session::Sort) (sortBox.getSelectedId() - 1)); };
     addAndMakeVisible (sortBox);
@@ -178,6 +194,10 @@ void DiscoverPanel::updateButtons()
     separateBtn.setButtonText (session.hasVocals() ? "Re-separate" : "Separate");
     sortBox.setEnabled (! session.getFragments().empty());
     sortBox.setItemEnabled (7, ! session.getSearch().isEmpty());
+    sortBox.setItemEnabled (8, session.hasReference());
+    ghostBtn.setEnabled (src);
+    ghostClear.setVisible (session.hasReference() || session.getReferenceFile() != juce::File());
+    ghostBtn.setToggleState (session.hasReference(), juce::dontSendNotification);
     clearBtn.setEnabled (! session.getFragments().empty());
     zoomSel.setEnabled (src && sel);
     trimBtn.setEnabled (src && sel && ! session.isBusy());
@@ -230,7 +250,10 @@ void DiscoverPanel::paint (juce::Graphics& g)
         const auto& q = session.getSearch();
         juce::StringArray parts;
         for (auto& c : q.constraints) parts.add (c.label);
+        if (q.likeFragment > 0) parts.insert (0, "similar to #" + juce::String (q.likeFragment));
         juce::String text = parts.isEmpty() ? juce::String() : "LOOKING FOR: " + parts.joinIntoString ("  /  ");
+        if (session.hasReference())
+            text = "GHOST MATCH: " + session.getReferenceFile().getFileName() + (text.isEmpty() ? "" : "     " + text);
         if (! q.ignoredWords.isEmpty()) text += (text.isEmpty() ? "" : "     ") + juce::String ("IGNORED: ") + q.ignoredWords.joinIntoString (", ");
         g.setColour (q.ignoredWords.isEmpty() ? colours::textDim : colours::warn);
         g.setFont (GhostLookAndFeel::label (10.0f));
@@ -298,6 +321,10 @@ void DiscoverPanel::resized()
     inspector.setBounds (browser.removeFromRight (juce::jlimit (400, 520, browser.getWidth() * 2 / 5)));
     browser.removeFromRight (8);
     auto searchRow = browser.removeFromTop (28);
+    ghostClear.setBounds (searchRow.removeFromRight (26));
+    searchRow.removeFromRight (2);
+    ghostBtn.setBounds (searchRow.removeFromRight (110));
+    searchRow.removeFromRight (6);
     sortBox.setBounds (searchRow.removeFromRight (150));
     searchRow.removeFromRight (6);
     searchBox.setBounds (searchRow);

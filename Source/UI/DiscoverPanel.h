@@ -49,6 +49,7 @@ private:
     juce::TextButton separateBtn { "Separate" }, viewOriginal { "Original" }, viewVocals { "Vocals" };
     juce::TextEditor searchBox;
     juce::ComboBox sortBox;
+    juce::TextButton ghostBtn { "Ghost match" }, ghostClear { "x" };
     void stepSelection (int delta);
 
     WaveformView waveform;

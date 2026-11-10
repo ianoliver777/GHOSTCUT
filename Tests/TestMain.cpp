@@ -14,6 +14,9 @@
 #include "Generation/ChopRenderer.h"
 #include "Generation/PatternExport.h"
 #include "DSP/Effects.h"
+#include "Analysis/ReferenceMatcher.h"
+#include "Presets/PresetManager.h"
+#include "FxParameters.h"
 #include <juce_events/juce_events.h>
 #include <juce_dsp/juce_dsp.h>
 #include <set>
@@ -1349,6 +1352,213 @@ struct RenderOptionsTests : juce::UnitTest
         expect (h != RenderOptions {});
     }
 };
+
+
+//==============================================================================
+// Phase 5
+//==============================================================================
+struct GhostMatchTests : juce::UnitTest
+{
+    GhostMatchTests() : juce::UnitTest ("GhostMatch", "GHOSTCUT") {}
+
+    static ReferenceMatcher::Signature sig (const SourceSnapshot& s)
+    {
+        auto ff = PhraseSegmenter::computeFrames (s);
+        return ReferenceMatcher::describeWhole (s, ff);
+    }
+
+    void runTest() override
+    {
+        beginTest ("DTW contour distance");
+        std::vector<float> a, b, c;
+        for (int i = 0; i < 32; ++i) { a.push_back (-0.2f * i); c.push_back (0.2f * i); }
+        for (int i = 0; i < 32; ++i) b.push_back (-0.2f * std::min (31.0f, i * 1.3f)); // same fall, different timing
+        expectEquals (ReferenceMatcher::contourDistance (a, a), 0.0f);
+        expectLessThan (ReferenceMatcher::contourDistance (a, b), ReferenceMatcher::contourDistance (a, c) * 0.3f);
+
+        beginTest ("same shape in another key beats a different shape");
+        auto ref   = makeVoice (44100, 1.2, 440, 330, 0, 0, 0.1);    // falling fifth-ish, A4 -> E4
+        auto same  = makeVoice (44100, 1.2, 330, 247, 0, 0, 0.1);    // same fall, a 4th lower
+        auto rise  = makeVoice (44100, 1.2, 330, 440, 0, 0, 0.1);    // rising
+        auto flatN = makeVoice (44100, 0.4, 200, 200, 0, 0, 0.8);    // short, noisy, flat
+        const auto r = sig (*ref);
+        const auto mSame = ReferenceMatcher::compare (r, sig (*same));
+        const auto mRise = ReferenceMatcher::compare (r, sig (*rise));
+        const auto mFlat = ReferenceMatcher::compare (r, sig (*flatN));
+        const auto mSelf = ReferenceMatcher::compare (r, r);
+        logMessage ("self " + juce::String (mSelf.total, 2) + "  same-shape " + juce::String (mSame.total, 2)
+                    + "  rising " + juce::String (mRise.total, 2) + "  short-noisy " + juce::String (mFlat.total, 2));
+        expectGreaterThan (mSelf.total, 0.95f);
+        expectGreaterThan (mSame.contour, mRise.contour + 0.3f);
+        expectGreaterThan (mSame.total, mRise.total);
+        expectGreaterThan (mRise.total, mFlat.total);
+        expect (mSame.describe().contains ("contour"));
+
+        beginTest ("session ranks the matching fragment first");
+        auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ghostcut_ghost_test");
+        dir.deleteRecursively(); dir.createDirectory();
+        auto srcFile = dir.getChildFile ("source.wav"), refFile = dir.getChildFile ("ref.wav");
+        auto src = makeTestSource (44100.0, 1);
+        expect (AudioExporter::writeRegion (*src, 0, src->numSamples(), srcFile, AudioExporter::BitDepth::Int24).isEmpty());
+        // reference: the A4 phrase re-synthesised slightly differently (louder, longer)
+        auto refVoice = makeVoice (44100, 0.9, 440, 440, 5.0, 0.15, 0.0);
+        expect (AudioExporter::writeRegion (*refVoice, 0, refVoice->numSamples(), refFile, AudioExporter::BitDepth::Int24).isEmpty());
+
+        SamplerEngine engine;
+        {
+            Session s (engine);
+            s.importFile (srcFile);
+            expect (waitUntil ([&] { return s.hasSource() && ! s.isBusy() && s.getFragments().size() == 3; }));
+            s.setReferenceFile (refFile);
+            expect (waitUntil ([&] { return s.hasReference(); }), s.getStatusText());
+            expect (s.getSort() == Session::Sort::Ghost);
+            expectEquals (s.getDisplayOrder().front(), 2);  // the A4 phrase
+            const auto saved = s.getStateTree();
+
+            beginTest ("advanced search: like #N and emphasis");
+            s.setSearchText ("like #3");
+            expectEquals (s.getSearch().likeFragment, 3);
+            expectEquals (s.getDisplayOrder().front(), 2);
+            auto q = SearchQuery::parse ("very airy sustained");
+            bool veryAiry = false;
+            for (auto& con : q.constraints) if (con.label == "very airy top end" && con.weight > 1.5f) veryAiry = true;
+            expect (veryAiry);
+
+            beginTest ("reference survives save/restore");
+            Session restored (engine);
+            restored.setStateTreeFromAnyThread (saved);
+            expect (waitUntil ([&] { return restored.hasSource() && ! restored.isBusy() && restored.hasReference(); }));
+            expectEquals (restored.getReferenceFile().getFileName(), juce::String ("ref.wav"));
+        }
+        engine.resetWhileAudioStopped();
+        dir.deleteRecursively();
+
+        beginTest ("optional interpreter contract: JSON round trip + validation");
+        auto q = SearchQuery::parse ("breathy descending like 4");
+        juce::String err;
+        auto back = SearchQuery::fromJson (q.toJson(), err);
+        expect (err.isEmpty(), err);
+        expectEquals ((int) back.constraints.size(), (int) q.constraints.size());
+        expectEquals (back.likeFragment, 4);
+        auto bad = juce::JSON::parse (R"({"constraints":[{"feature":"emotion","from":0,"to":1}]})");
+        SearchQuery::fromJson (bad, err);
+        expect (err.contains ("unknown feature"));
+    }
+};
+
+struct PitchCleanupTests : juce::UnitTest
+{
+    PitchCleanupTests() : juce::UnitTest ("Pitch cleanup", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("strong 2nd harmonic does not cause octave jumps");
+        auto s = std::make_shared<SourceSnapshot>();
+        s->sampleRate = 44100;
+        s->audio.setSize (1, 44100 * 2);
+        double ph = 0;
+        for (int i = 0; i < s->audio.getNumSamples(); ++i)
+        {
+            ph += 2 * juce::MathConstants<double>::pi * 180.0 / 44100.0;
+            s->audio.setSample (0, i, (float) (0.15 * std::sin (ph) + 0.4 * std::sin (2 * ph) + 0.1 * std::sin (3 * ph)));
+        }
+        auto ff = PhraseSegmenter::computeFrames (*s);
+        int voiced = 0, off = 0;
+        for (auto f : ff.f0)
+            if (f > 0) { ++voiced; if (std::abs (12.0 * std::log2 (f / 180.0)) > 2.0) ++off; }
+        logMessage ("voiced frames " + juce::String (voiced) + ", off-pitch " + juce::String (off));
+        expectGreaterThan (voiced, 150);
+        expectLessThan ((float) off / (float) voiced, 0.02f);
+    }
+};
+
+/** Minimal host for the preset system: the same parameter layout as the plugin. */
+struct PresetTestProcessor : juce::AudioProcessor
+{
+    PresetTestProcessor() : juce::AudioProcessor (BusesProperties().withOutput ("Out", juce::AudioChannelSet::stereo(), true)),
+                            apvts (*this, nullptr, "PARAMS", layout()) {}
+    static juce::AudioProcessorValueTreeState::ParameterLayout layout()
+    {
+        juce::AudioProcessorValueTreeState::ParameterLayout l;
+        l.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "keyMode", 1 }, "Key Mode", juce::StringArray { "Slices", "Chromatic" }, 0));
+        l.add (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "trigger", 1 }, "Trigger", juce::StringArray { "One-shot", "Gate" }, 0));
+        l.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "attack", 1 }, "Attack", juce::NormalisableRange<float> (0, 2000), 2.0f));
+        l.add (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "release", 1 }, "Release", juce::NormalisableRange<float> (5, 5000), 120.0f));
+        fxp::addParameters (l);
+        return l;
+    }
+    const juce::String getName() const override { return "test"; }
+    void prepareToPlay (double, int) override {}
+    void releaseResources() override {}
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override {}
+    using juce::AudioProcessor::processBlock;
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return true; }
+    bool producesMidi() const override { return false; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+    void getStateInformation (juce::MemoryBlock&) override {}
+    void setStateInformation (const void*, int) override {}
+    juce::AudioProcessorValueTreeState apvts;
+};
+
+struct PresetTests : juce::UnitTest
+{
+    PresetTests() : juce::UnitTest ("Presets", "GHOSTCUT") {}
+    void runTest() override
+    {
+        PresetTestProcessor proc;
+        SamplerEngine engine;
+        Session session (engine);
+        PresetManager pm (proc.apvts, session);
+        auto value = [&] (const char* id) { auto* p = proc.apvts.getParameter (id); return p->convertFrom0to1 (p->getValue()); };
+
+        beginTest ("factory presets: mode FX + generation settings");
+        expectGreaterThan (pm.numFactory(), 15);
+        int cathedral = -1;
+        for (int i = 0; i < pm.numFactory(); ++i) if (pm.factoryName (i) == "Cathedral") cathedral = i;
+        expect (cathedral >= 0);
+        auto g = session.getGenSettings(); g.seed = 4321; session.setGenSettings (g);
+        expect (pm.loadFactory (cathedral));
+        expect (session.getGenSettings().mode == GenMode::Heaven);
+        expectEquals ((int) session.getGenSettings().seed, 4321, "presets never change the seed");
+        expectWithinAbsoluteError (value (fxp::revDecay), 14.0f, 0.2f);
+        expectGreaterThan (value (fxp::revOn), 0.5f);
+        expectEquals (pm.getCurrentName(), juce::String ("Cathedral"));
+
+        beginTest ("user preset save / load round trip, then delete");
+        const auto presetName = "zz_test_" + juce::String (juce::Random::getSystemRandom().nextInt (100000));
+        proc.apvts.getParameter (fxp::revMix)->setValueNotifyingHost (proc.apvts.getParameter (fxp::revMix)->convertTo0to1 (0.77f));
+        juce::String err;
+        expect (pm.saveUser (presetName, "User", err), err);
+        proc.apvts.getParameter (fxp::revMix)->setValueNotifyingHost (0.0f);
+        pm.loadFactory (0);
+        PresetManager::Info found;
+        for (auto& info : pm.list()) if (info.name == presetName) found = info;
+        expect (found.file.existsAsFile());
+        expect (pm.load (found, err), err);
+        expectWithinAbsoluteError (value (fxp::revMix), 0.77f, 0.01f);
+        expect (session.getGenSettings().mode == GenMode::Heaven);
+        expect (pm.deleteUser (found, err), err);
+        expect (! found.file.existsAsFile());
+
+        beginTest ("next / previous walks the list");
+        pm.loadFactory (0);
+        pm.step (1);
+        expectEquals (pm.getCurrentName(), pm.factoryName (1));
+        pm.step (-1);
+        expectEquals (pm.getCurrentName(), pm.factoryName (0));
+        engine.resetWhileAudioStopped();
+    }
+};
+
+static GhostMatchTests ghostMatchTests;
+static PitchCleanupTests pitchCleanupTests;
+static PresetTests presetTests;
 
 static EffectsTests effectsTests;
 static RenderOptionsTests renderOptionsTests;

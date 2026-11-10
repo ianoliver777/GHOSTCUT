@@ -35,6 +35,7 @@ struct SourceSnapshot
     juce::String contentHash;      // used to detect a different file at the same path
     int64_t trimStart = 0;          // offset of audio[0] within the original file
     int64_t trimEnd   = -1;         // -1 = to end of file
+    juce::String variant;           // "" = the original audio, otherwise the separation method id
 
     WaveformPeaks peaks;
 

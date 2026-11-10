@@ -44,6 +44,9 @@ namespace ghostcut::fxp
         std::atomic<float> *pSemi, *pFine, *pFormant, *pHarm, *pRevAll, *pRevX, *follow;
     };
 
+    using ParamValues = std::vector<std::pair<juce::String, float>>;
+    /** The effect settings that belong to a generation mode (real units, not 0..1). */
+    ParamValues modePresetValues (GenMode);
     /** Loads the effects that belong to a generation mode (message thread). */
     void applyModePreset (juce::AudioProcessorValueTreeState&, GenMode);
 }

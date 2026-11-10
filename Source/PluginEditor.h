@@ -6,6 +6,7 @@
 #include "UI/GeneratePanel.h"
 #include "UI/SequencePanel.h"
 #include "UI/EffectsPanel.h"
+#include "UI/PresetBar.h"
 
 /** Simple honest panel for pages that are scheduled for a later phase. */
 class PlannedPanel : public juce::Component
@@ -53,6 +54,7 @@ public:
     void paintOverChildren (juce::Graphics&) override;
     void resized() override;
     void mouseUp (const juce::MouseEvent&) override;
+    bool keyPressed (const juce::KeyPress&) override;
 
     bool isInterestedInFileDrag (const juce::StringArray& files) override;
     void fileDragEnter (const juce::StringArray&, int, int) override { dragHover = true; repaint(); }
@@ -74,6 +76,7 @@ private:
     ghostcut::GeneratePanel generate;
     ghostcut::SequencePanel sequence;
     ghostcut::EffectsPanel effects;
+    ghostcut::PresetBar presetBar;
     SettingsPanel settings;
     int currentTab = 0;
 

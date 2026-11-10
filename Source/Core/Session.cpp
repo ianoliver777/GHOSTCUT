@@ -17,6 +17,7 @@ namespace ids
     static const juce::Identifier view { "view" }, granularity { "granularity" }, sort { "sort" }, search { "search" };
     static const juce::Identifier vocalsMethod { "vocalsMethod" }, sepMethod { "sepMethod" }, sepModel { "sepModel" };
     static const juce::Identifier patterns { "PATTERNS" }, patternSlot { "slot" }, pinned { "pinned" };
+    static const juce::Identifier referencePath { "reference" };
 }
 
 static VocalSeparator::Options defaultSeparationOptions()
@@ -181,7 +182,16 @@ void Session::startFrameAnalysis (bool segmentAfter)
     runJob ("frames", [this, aliveFlag, jobGen, snap, segmentAfter]
     {
         auto keepGoing = [this, aliveFlag, jobGen] { return aliveFlag->load() && generation.load() == jobGen; };
-        auto ff = std::make_shared<FrameFeatures> (PhraseSegmenter::computeFrames (*snap, [this] (float p) { progress = p; }, keepGoing));
+        // analysis cache: keyed by file fingerprint, trim and which audio (original / vocals method)
+        const auto cacheFile = VocalSeparator::getCacheFolder().getChildFile (
+            "frames_" + snap->contentHash + "_" + juce::String (snap->trimStart) + "_" + juce::String (snap->numSamples()) + "_"
+            + (snap->variant.isEmpty() ? juce::String ("orig") : snap->variant) + ".gcff");
+        auto ff = std::make_shared<FrameFeatures>();
+        if (snap->contentHash.isEmpty() || ! FrameFeatures::load (cacheFile, *ff))
+        {
+            *ff = PhraseSegmenter::computeFrames (*snap, [this] (float p) { progress = p; }, keepGoing);
+            if (ff->numFrames() > 0 && snap->contentHash.isNotEmpty()) ff->save (cacheFile);
+        }
 
         juce::MessageManager::callAsync ([this, aliveFlag, jobGen, ff, segmentAfter]
         {
@@ -192,6 +202,7 @@ void Session::startFrameAnalysis (bool segmentAfter)
 
             // (re)measure everything against the current analysis audio
             for (auto& f : fragments) PhraseSegmenter::measure (f, *analysisSnapshot(), *frames);
+            rebuildSignatures();
 
             if (segmentAfter) analyze();
             else { publishTable(); updateStateCache(); setStatus (snapshot->displayName + " ready"); }
@@ -311,6 +322,7 @@ void Session::sortAndPublish (int64_t keepSelectedUid)
         if (fragments[(size_t) i].uid == keepSelectedUid) selectedIndex = i;
     engine.setSelectedFragment (selectedIndex);
     publishTable();
+    rebuildSignatures();
     updateStateCache();
     sendChangeMessage();
     if (hasPattern() && ! busy) renderPatternAsync();
@@ -404,6 +416,7 @@ void Session::updateStateCache()
     t.setProperty (ids::vocalsMethod, vocals != nullptr ? vocalsMethodId : pendingVocalsMethod, nullptr);
     t.setProperty (ids::sepMethod, (int) sepOptions.method, nullptr);
     t.setProperty (ids::sepModel, sepOptions.model.file.getFileName(), nullptr);
+    t.setProperty (ids::referencePath, referenceFile.getFullPathName(), nullptr);
     {
         juce::StringArray pins;
         for (auto u : pinned) pins.add (juce::String (u));
@@ -501,6 +514,12 @@ void Session::restoreOnMessageThread (const juce::ValueTree& t)
     searchText = t.getProperty (ids::search).toString();
     search = SearchQuery::parse (searchText);
     pendingVocalsMethod = t.getProperty (ids::vocalsMethod).toString();
+    {
+        reference = {};
+        const juce::String refPath = t.getProperty (ids::referencePath).toString();
+        referenceFile = refPath.isNotEmpty() ? juce::File (refPath) : juce::File();
+        if (referenceFile.existsAsFile()) setReferenceFile (referenceFile);
+    }
     {
         pinned.clear();
         juce::StringArray pins;
@@ -667,8 +686,10 @@ void Session::setSort (Sort s)
 void Session::setSearchText (const juce::String& text)
 {
     searchText = text.trim();
-    search = SearchQuery::parse (searchText);
-    if (! search.isEmpty()) sort = Sort::Match;
+    juce::String err;
+    search = interpreter->interpret (searchText, err);
+    if (err.isNotEmpty()) search = SearchQuery::parse (searchText); // optional interpreters fall back to keywords
+    if (! search.isEmpty() || search.likeFragment > 0) sort = Sort::Match;
     else if (sort == Sort::Match) sort = Sort::Time;
     updateStateCache();
     sendChangeMessage();
@@ -679,7 +700,18 @@ float Session::sortValue (int index) const
     if (index < 0 || index >= (int) fragments.size()) return 0.0f;
     const auto& f = fragments[(size_t) index];
     if (sort == Sort::Time)  return 0.0f;
-    if (sort == Sort::Match) return search.match (f);
+    if (sort == Sort::Ghost) return getGhostMatch (index).total;
+    if (sort == Sort::Match)
+    {
+        // "like #12" blends similarity to that fragment with the keyword constraints
+        const int like = search.likeFragment - 1;
+        if (like >= 0 && like < (int) fragments.size())
+        {
+            const float sim = fragmentSimilarity (like, index);
+            return search.constraints.empty() ? sim : 0.5f * sim + 0.5f * search.match (f);
+        }
+        return search.match (f);
+    }
     return f.scores[(int) sort - 1];
 }
 
@@ -890,6 +922,70 @@ juce::File Session::renderMidiForDrag (juce::String& error) const
     f.getParentDirectory().createDirectory();
     error = exportMidi (f);
     return error.isEmpty() ? f : juce::File();
+}
+
+//==============================================================================
+// GHOST MATCH
+//==============================================================================
+void Session::rebuildSignatures()
+{
+    signatures.clear();
+    auto snap = analysisSnapshot();
+    if (frames == nullptr || snap == nullptr) return;
+    signatures.reserve (fragments.size());
+    for (auto& f : fragments) signatures.push_back (ReferenceMatcher::describe (*snap, *frames, f.start, f.end));
+}
+
+ReferenceMatcher::Match Session::getGhostMatch (int i) const
+{
+    if (! reference.valid || i < 0 || i >= (int) signatures.size()) return {};
+    return ReferenceMatcher::compare (reference, signatures[(size_t) i]);
+}
+
+float Session::fragmentSimilarity (int i, int j) const
+{
+    if (i < 0 || j < 0 || i >= (int) signatures.size() || j >= (int) signatures.size()) return 0.0f;
+    return ReferenceMatcher::compare (signatures[(size_t) i], signatures[(size_t) j]).total;
+}
+
+void Session::clearReference()
+{
+    reference = {};
+    referenceFile = juce::File();
+    if (sort == Sort::Ghost) sort = Sort::Time;
+    updateStateCache();
+    sendChangeMessage();
+}
+
+void Session::setReferenceFile (const juce::File& f)
+{
+    if (! importer.canImport (f)) { setStatus ("GHOST MATCH: can't read " + f.getFileName(), true); return; }
+    referenceFile = f;
+    updateStateCache();
+    setStatus ("GHOST MATCH: analysing reference " + f.getFileName() + "...");
+    auto aliveFlag = alive;
+    runJob ("reference", [this, aliveFlag, f]
+    {
+        AudioImporter localImporter;   // the reference is only measured, never kept or played
+        auto res = localImporter.load (f, 0, -1, {}, [aliveFlag] { return aliveFlag->load(); });
+        ReferenceMatcher::Signature sig;
+        if (res.snapshot != nullptr)
+        {
+            auto ff = PhraseSegmenter::computeFrames (*res.snapshot);
+            sig = ReferenceMatcher::describeWhole (*res.snapshot, ff);
+        }
+        juce::MessageManager::callAsync ([this, aliveFlag, sig, f, err = res.error]
+        {
+            if (! aliveFlag->load() || f != referenceFile) return;
+            if (! sig.valid) { setStatus ("GHOST MATCH failed: " + (err.isNotEmpty() ? err : juce::String ("no audible audio")), true); return; }
+            reference = sig;
+            sort = Sort::Ghost;
+            updateStateCache();
+            setStatus ("GHOST MATCH: ranked by similarity to " + f.getFileName()
+                       + (sig.medianNote > 0 ? " (" + noteName ((int) std::lround (sig.medianNote)) + ", " : " (unpitched, ")
+                       + juce::String (sig.f.durationSec, 2) + " s)");
+        });
+    });
 }
 
 } // namespace ghostcut
