@@ -7,7 +7,7 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 
 ---
 
-## Status: Phase 2 (vocal intelligence)
+## Status: Phase 3 (generation engine)
 
 | Feature | State |
 |---|---|
@@ -27,11 +27,24 @@ VST3 / AU / Standalone · macOS (Apple Silicon + Intel, universal) · Windows 10
 | **Character scores** ETHEREAL / HAUNTED / NOSTALGIC / HEAVENLY / EXPERIMENTAL (labelled heuristics, each explains *why*) | ✅ working |
 | **Search**: describe what you want, mapped to measurable features, shows what it understood and ignored | ✅ working |
 | **Sort** by time, any score, or search match | ✅ working |
-| GENERATE / SEQUENCE | ⏳ Phase 3 |
+| **GENERATE**: 5 modes (ETHEREAL / HAUNTED / NOSTALGIA / HEAVEN / CHAOS) that change rhythm, melody, layering and per-chop DSP | ✅ working |
+| Key, scale, range, steps, rate, density, complexity, randomness, swing, **seeded and reproducible** | ✅ working |
+| Pitch-aware chops: formant-preserving pitch shift, time stretch, reverse, sub-range, fades, harmony layers (Signalsmith Stretch) | ✅ working |
+| **SEQUENCE**: 16/32 steps, slot lanes, per-step note / velocity / gate / chop range / reverse / ratchet / layer / choke | ✅ working |
+| Host tempo + transport sync (sample-accurate), swing, internal play for preview | ✅ working |
+| Pattern bank A–H saved in the project | ✅ working |
+| Export loop WAV (seamless, tail wrapped) and MIDI. Drag either straight into Live | ✅ working |
 | EFFECTS | ⏳ Phase 4 |
 | GHOST MATCH, preset library | ⏳ Phase 5 |
 
 Tabs for unbuilt phases are visible but clearly marked as not built yet.
+
+### Verified in Phase 3
+- Same seed → identical pattern (tested, including after save/restore). Notes stay in key for the in-key modes over 120 seeds.
+- Modes differ measurably (200 seeds each): CHAOS ~8.7 hits/bar vs HEAVEN ~3; HEAVEN holds notes 2× longer than NOSTALGIA; HAUNTED reverses >30% of hits; HEAVEN layers harmonies on >60%.
+- Pitch shift +7 st lands within 0.3 st. Stretch ×2 keeps pitch. Formants preserved on a +12 st shift (vowel centroid 1894 → 1871 Hz vs 3413 Hz without preservation).
+- Sequencer: steps fire on the exact sample at 120 bpm, swing offset exact, ratchets ×4, gates, host stop releases voices, loop jumps resync, and a pattern swap frees the old pattern only after its voices finish.
+- pluginval strictness 10 passes.
 
 ### Verified in Phase 2
 - C++ MDX separation reproduces the Python/ONNX Runtime reference exactly: **19.95 dB SDR** on a speech + drums + bass test mix (the unseparated mix scores −9.97 dB). It runs at ~1.8× realtime on 4 CPU threads.
@@ -127,6 +140,26 @@ Only these two exact files are accepted, because their parameters (n_fft 7680, 3
 
 How it works: audio → 44.1 kHz stereo (Kaiser-windowed sinc resampler) → chunks of 261,120 samples with 3,840-sample trims → torch-compatible STFT (pocketfft) → model → ISTFT → back to the source rate. Separated stems are cached as 32-bit float WAV, keyed by source fingerprint + trim + model, so reopening a project or re-analysing is instant.
 
+## Generate + Sequence
+
+1. Discover fragments (ideally on VOCALS). Optionally **PIN** up to 8 in the Discover inspector, otherwise the generator uses the 6 that score highest for the mode.
+2. GENERATE page: pick a mode, key/scale/range, and density / complexity / randomness / swing, then **GENERATE** (new seed) or **REBUILD** (same seed).
+3. In Live the pattern plays whenever the transport runs (Sync: host transport). In the standalone app, press PLAY.
+4. SEQUENCE page: edit the pattern by lanes, one row per fragment. Click a cell to place that fragment, click again to remove it, drag up/down for velocity. The inspector covers note, gate, chop range, reverse, ratchet, layer and choke. Slots A–H hold 8 patterns.
+5. Export a loop WAV or a MIDI file, or drag either straight into Live.
+
+What each mode actually does (`Source/Generation/PatternGenerator.cpp`):
+
+| Mode | Rhythm | Melody | Per-chop DSP |
+|---|---|---|---|
+| ETHEREAL | sparse, on strong beats, notes overlap | stepwise, motif of 8 | slowed ×1.3–2, 40/220 ms fades, +12/+7 shimmer layers, formant up to +1.5 st |
+| HAUNTED | off-grid, syncopated | small steps, 25% chromatic "wrong" notes, tritones | 45% reversed, slowed ×1.6–2.6, long 350 ms tails, darker formants (−4 to −1.5 st), ghost layer an octave down |
+| NOSTALGIA | swing-friendly boom-bap pocket | repetitive 4-step motif | near-natural speed, short chops, 55% fragment repetition, slight detune |
+| HEAVEN | very sparse, long holds | slow stepwise | stretched to fill the gate, stacked +12/+7/+4 harmonies (80%), bright formants |
+| CHAOS | dense | big leaps | ratchets ×2–4, random chop starts, ×0.5–1.5 speed, formant ±6 st, 1–4 ms fades |
+
+Phase 4 adds a matching effects chain per mode.
+
 ## Search: what it understands
 
 Search is **keyword-to-feature mapping, not AI language understanding**. It turns words into measurable targets and always shows what it used and what it ignored:
@@ -169,6 +202,9 @@ Source/
   Audio/       AudioImporter (decode, peaks, fingerprint), SamplerEngine (voices, MIDI), AudioExporter
   Analysis/    PhraseSegmenter (energy / flux / YIN, phrases + syllables), FeatureExtractor, FragmentRanker,
                SearchQuery, VocalSeparator (MDX + center extract + cache), OnnxRuntime (dynamic loader), Stft
+  Generation/  Random (PCG32), ScaleQuantizer, Pattern, PatternGenerator (+ mode profiles), ChopRenderer
+               (Signalsmith), PatternExport (loop WAV + MIDI)
+  UI/          + PatternView (roll / lanes editor), GeneratePanel, SequencePanel
   UI/          GhostLookAndFeel, WaveformView, FragmentBrowser, DiscoverPanel
   PluginProcessor / PluginEditor
 Tests/         GhostcutTests console app
@@ -194,13 +230,13 @@ Planned additions follow the brief: `Analysis/VocalSeparator` (ONNX), `FeatureEx
 | Steinberg VST3 SDK 3.8 (bundled in JUCE) | VST3 format | MIT | |
 | ONNX Runtime 1.20.1 | ML inference (CPU) | MIT | shared library copied into each bundle (`Contents/Frameworks` on mac, next to the binary on Windows) and loaded by absolute path at run time |
 | pocketfft (C++ header) | arbitrary-size FFT (n_fft 7680) | BSD-3-Clause | `ThirdParty/pocketfft` |
+| Signalsmith Stretch 1.4.0 + Signalsmith Linear 0.6.6 | pitch shift, time stretch, formants | MIT | `ThirdParty/signalsmith-*`. Uses Accelerate on macOS |
 | MDX-Net vocal models (Kim Vocal 2, UVR Voc FT) | vocal separation | **unclear for commercial redistribution** | not shipped. The user installs them, see above |
 | pluginval (CI only, not shipped) | validation | GPLv3 | tool, not linked |
 
 **Planned:**
 | Component | Purpose | License | Note |
 |---|---|---|---|
-| Signalsmith Stretch | time-stretch / pitch-shift (Phase 3) | MIT | avoid Rubber Band (GPL unless commercially licensed) |
 | Demucs (htdemucs) | possible higher-quality separation | code MIT | weights not reachable from the dev environment; MDX-Net chosen instead for Phase 2 |
 | CREPE-tiny (optional) | ML pitch upgrade over YIN | MIT | only if YIN proves insufficient on real vocals |
 
@@ -220,7 +256,9 @@ Planned additions follow the brief: `Analysis/VocalSeparator` (ONNX), `FeatureEx
 - ML separation runs on the CPU (~1.8× realtime with 4 threads). A 4-minute song takes about 2 minutes the first time, then it's instant from the cache. It deliberately uses half your cores so the DAW keeps playing.
 - Character scores and breathiness are heuristics from measured features. The weights were tuned on synthetic material and should be tuned further on real vocals.
 - Pitch tracking is YIN (70–1100 Hz). Very breathy or whispered material often has no stable pitch, which is shown as "no stable pitch".
-- Stealing a voice when all 32 are busy restarts it without a crossfade (rare, may click).
+- Stealing a voice when all 48 are busy restarts it without a crossfade (rare, may click).
+- Chops are pre-rendered (pitch/stretch/formant) on a worker thread whenever the pattern, the view or the tempo changes (fit-to-gate modes). Edits take effect after a short render, usually well under a second.
+- Re-running ANALYZE gives fragments new ids, so a pattern built on the old ones shows "MISSING" lanes until you regenerate.
 - Binaries are not code-signed or notarized yet (Phase 6).
 - AU manufacturer code `T7Au` / plugin code `Ghct`. If other TRIPLE SEVEN AUDIO plugins already use a different manufacturer code, align it **before the first public release** (changing it later breaks saved projects).
 

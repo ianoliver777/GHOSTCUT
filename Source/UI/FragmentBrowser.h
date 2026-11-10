@@ -56,7 +56,7 @@ private:
 
     Session& session;
     juce::ComboBox rootBox;
-    juce::TextButton audition { "Audition" }, exportBtn { "Export WAV" }, del { "Delete" };
+    juce::TextButton audition { "Audition" }, exportBtn { "Export WAV" }, del { "Delete" }, pin { "Pin" };
     std::unique_ptr<DragHandle> dragHandle;
     std::unique_ptr<juce::FileChooser> chooser;
 };

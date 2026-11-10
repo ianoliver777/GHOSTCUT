@@ -5,6 +5,8 @@
 #include "../Analysis/PhraseSegmenter.h"
 #include "../Analysis/VocalSeparator.h"
 #include "../Analysis/SearchQuery.h"
+#include "../Generation/PatternGenerator.h"
+#include "../Generation/PatternExport.h"
 #include "../Audio/AudioImporter.h"
 #include "../Audio/AudioExporter.h"
 #include "../Audio/SamplerEngine.h"
@@ -27,7 +29,8 @@ namespace ghostcut
       - getStateTree() may be called from any thread (hosts do this); it returns a
         cached copy guarded by a lock that is never taken on the audio thread.
 */
-class Session : public juce::ChangeBroadcaster
+class Session : public juce::ChangeBroadcaster,
+                private juce::Timer
 {
 public:
     explicit Session (SamplerEngine& engine);
@@ -84,6 +87,32 @@ public:
     std::vector<int> getDisplayOrder() const;
     float sortValue (int index) const;
 
+    // ---- generation (GENERATE / SEQUENCE) ----
+    static constexpr int numPatternSlots = 8;
+    const GenSettings& getGenSettings() const noexcept { return gen; }
+    void setGenSettings (const GenSettings& g) { gen = g; updateStateCache(); sendChangeMessage(); }
+    /** Builds a new pattern. newSeed = roll a fresh seed first (unless you want to reproduce). */
+    void generate (bool newSeed);
+    const Pattern& getPattern() const noexcept { return pattern; }
+    void setPattern (const Pattern& p);                  // edits from the SEQUENCE page
+    bool hasPattern() const noexcept { return pattern.numEvents() > 0 && ! pattern.slotUids.empty(); }
+    int getPatternSlot() const noexcept { return patternSlot; }
+    void selectPatternSlot (int slot);                   // A..H bank, current pattern is kept in its slot
+    bool isPatternSlotUsed (int slot) const { return slot >= 0 && slot < numPatternSlots && bank[(size_t) slot].numEvents() > 0; }
+    void togglePin (int fragmentIndex);
+    bool isPinned (int fragmentIndex) const;
+    int numPinned() const noexcept { return (int) pinned.size(); }
+    std::vector<GenSlot> currentGenSlots() const;
+    void setPatternPlaying (bool run);
+    bool isRenderingPattern() const noexcept { return renderingPattern; }
+    double getBpm() const noexcept { return engine.getLastBpm(); }
+    juce::String exportLoop (const juce::File& dest, int loops) const;
+    juce::String exportMidi (const juce::File& dest) const;
+    juce::File renderLoopForDrag (juce::String& error) const;
+    juce::File renderMidiForDrag (juce::String& error) const;
+    /** Fragment index for a pattern slot (or -1 if that fragment no longer exists). */
+    int fragmentIndexForSlot (int slot) const;
+
     // ---- waveform selection / transport ----
     int64_t getSelectionStart() const noexcept { return selStart; }
     int64_t getSelectionEnd() const noexcept { return selEnd; }
@@ -118,6 +147,8 @@ private:
     void startLoad (const juce::File& f, int64_t trimStart, int64_t trimEnd, bool autoAnalyze,
                     std::vector<Fragment> keepFragments, const juce::String& expectedHash);
     void startFrameAnalysis (bool segmentAfter);
+    void renderPatternAsync();
+    void timerCallback() override;
     void startSeparation (bool silentIfMissingCache);
     SnapshotPtr analysisSnapshot() const { return vocals != nullptr ? vocals : snapshot; }
     void publishPlayback();
@@ -141,6 +172,15 @@ private:
     Sort sort = Sort::Time;
     juce::String searchText;
     SearchQuery search;
+    GenSettings gen;
+    Pattern pattern;
+    std::array<Pattern, numPatternSlots> bank;
+    int patternSlot = 0;
+    std::vector<int64_t> pinned;
+    std::shared_ptr<const RenderedPattern> rendered;
+    double renderedBpm = 0.0;
+    bool renderingPattern = false;
+    std::atomic<int> patternGeneration { 0 };
     std::shared_ptr<const FrameFeatures> frames;
     std::vector<Fragment> fragments;
     int selectedIndex = -1;

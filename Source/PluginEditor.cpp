@@ -146,7 +146,7 @@ void SettingsPanel::paint (juce::Graphics& g)
     }, colours::textDim);
 
     heading (aboutArea, "ABOUT");
-    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 2 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
+    lines (aboutArea.withTrimmedTop (16), { juce::String ("GHOSTCUT ") + JucePlugin_VersionString + "  /  Phase 3 build  /  TRIPLE SEVEN AUDIO" }, colours::textDim);
 }
 
 void SettingsPanel::resized()
@@ -174,10 +174,8 @@ void SettingsPanel::resized()
 GhostcutEditor::GhostcutEditor (GhostcutProcessor& p)
     : AudioProcessorEditor (p), processor (p), session (p.getSession()),
       discover (p.getSession(), p.getEngine(), p.getParameters()),
-      generate ("GENERATE", "PHASE 3", { "Automatic chop generation from selected fragments",
-                                         "ETHEREAL / HAUNTED / NOSTALGIA / HEAVEN / CHAOS generation modes",
-                                         "Key, scale, BPM, density and seeded randomness" }),
-      sequence ("SEQUENCE", "PHASE 3", { "16 / 32-step patterns with swing", "Host tempo sync", "Pattern save and MIDI export" }),
+      generate (p.getSession(), p.getEngine(), p.getParameters()),
+      sequence (p.getSession(), p.getEngine()),
       effects ("EFFECTS", "PHASE 4", { "Reverb, delay, pitch / formant, texture, reverse, lo-fi",
                                        "Integrated with playback and export" }),
       settings (p.getSession())

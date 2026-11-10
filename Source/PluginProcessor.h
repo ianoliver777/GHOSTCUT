@@ -13,6 +13,9 @@ namespace ghostcut::param
     inline constexpr const char* trigger   = "trigger";
     inline constexpr const char* baseNote  = "baseNote";
     inline constexpr const char* velSens   = "velSens";
+    inline constexpr const char* seqMode   = "seqMode";
+    inline constexpr const char* tempo     = "tempo";
+    inline constexpr const char* patLevel  = "patLevel";
 }
 
 class GhostcutProcessor final : public juce::AudioProcessor,
@@ -66,6 +69,9 @@ private:
     std::atomic<float>* pTrigger = nullptr;
     std::atomic<float>* pBaseNote = nullptr;
     std::atomic<float>* pVelSens = nullptr;
+    std::atomic<float>* pSeqMode = nullptr;
+    std::atomic<float>* pTempo = nullptr;
+    std::atomic<float>* pPatLevel = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GhostcutProcessor)
 };

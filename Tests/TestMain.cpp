@@ -10,7 +10,11 @@
 #include "Analysis/FeatureExtractor.h"
 #include "Analysis/FragmentRanker.h"
 #include "Analysis/SearchQuery.h"
+#include "Generation/PatternGenerator.h"
+#include "Generation/ChopRenderer.h"
+#include "Generation/PatternExport.h"
 #include <juce_events/juce_events.h>
+#include <juce_dsp/juce_dsp.h>
 
 using namespace ghostcut;
 
@@ -733,6 +737,391 @@ struct SeparationSessionTests : juce::UnitTest
         dir.deleteRecursively();
     }
 };
+
+
+//==============================================================================
+// Phase 3
+//==============================================================================
+namespace
+{
+    float medianPitch (const juce::AudioBuffer<float>& b, double sr)
+    {
+        auto s = std::make_shared<SourceSnapshot>();
+        s->sampleRate = sr;
+        s->audio = b;
+        auto frames = PhraseSegmenter::computeFrames (*s);
+        std::vector<float> hz;
+        for (auto v : frames.f0) if (v > 0) hz.push_back (v);
+        if (hz.empty()) return 0.0f;
+        std::nth_element (hz.begin(), hz.begin() + (long) hz.size() / 2, hz.end());
+        return hz[hz.size() / 2];
+    }
+
+    std::vector<GenSlot> testSlots()
+    {
+        return { { 1, 57, 0.8f, 0.9f }, { 2, 64, 0.9f, 0.6f }, { 3, 69, 0.7f, 0.3f } };
+    }
+
+    int onsetSample (const juce::AudioBuffer<float>& b, int from, float thresh = 1.0e-4f)
+    {
+        for (int i = from; i < b.getNumSamples(); ++i) if (std::abs (b.getSample (0, i)) > thresh) return i;
+        return -1;
+    }
+}
+
+struct GeneratorTests : juce::UnitTest
+{
+    GeneratorTests() : juce::UnitTest ("PatternGenerator", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("scales and quantiser");
+        expectEquals (ScaleQuantizer::degreeToMidi (57, ScaleQuantizer::Scale::Minor, 0), 57);
+        expectEquals (ScaleQuantizer::degreeToMidi (57, ScaleQuantizer::Scale::Minor, 2), 60);  // A -> C
+        expectEquals (ScaleQuantizer::degreeToMidi (57, ScaleQuantizer::Scale::Minor, 7), 69);  // octave
+        expectEquals (ScaleQuantizer::degreeToMidi (57, ScaleQuantizer::Scale::Minor, -1), 55); // G below
+        expectEquals (ScaleQuantizer::quantize (61, 9, ScaleQuantizer::Scale::Minor), 60);      // C# -> C in A minor
+        expect (ScaleQuantizer::inScale (64, 9, ScaleQuantizer::Scale::Minor));
+        expect (! ScaleQuantizer::inScale (66, 9, ScaleQuantizer::Scale::Minor));
+
+        beginTest ("same seed = same pattern, different seed = different");
+        GenSettings g;
+        auto a = PatternGenerator::generate (g, testSlots(), 120.0);
+        auto b = PatternGenerator::generate (g, testSlots(), 120.0);
+        expect (a.toTree().isEquivalentTo (b.toTree()));
+        g.seed = 778;
+        auto c = PatternGenerator::generate (g, testSlots(), 120.0);
+        expect (! a.toTree().isEquivalentTo (c.toTree()));
+        expect (a.active[0], "step 1 always plays");
+
+        beginTest ("notes stay in key (modes without chromatic notes)");
+        for (auto mode : { GenMode::Ethereal, GenMode::Heaven, GenMode::Nostalgia })
+            for (uint32_t seed = 1; seed < 40; ++seed)
+            {
+                GenSettings s; s.mode = mode; s.seed = seed; s.key = 9; s.scale = ScaleQuantizer::Scale::Minor;
+                auto p = PatternGenerator::generate (s, testSlots(), 120.0);
+                for (int i = 0; i < p.length; ++i)
+                    if (p.active[(size_t) i])
+                    {
+                        const auto& e = p.events[(size_t) i];
+                        if (getModeProfile (mode).chromaticProb == 0.0f)
+                            expect (ScaleQuantizer::inScale (e.note, 9, ScaleQuantizer::Scale::Minor), juce::String (genModeName (mode)) + " note " + juce::String (e.note));
+                        expectLessOrEqual (std::abs (e.note - p.slotRoots[(size_t) e.slot]), 14);
+                    }
+            }
+
+        beginTest ("modes are statistically different");
+        auto stats = [] (GenMode m)
+        {
+            struct { double hits = 0, gate = 0, rev = 0, ratchet = 0, layers = 0; } st;
+            int n = 0;
+            for (uint32_t seed = 1; seed <= 200; ++seed)
+            {
+                GenSettings s; s.mode = m; s.seed = seed;
+                auto p = PatternGenerator::generate (s, testSlots(), 120.0);
+                for (int i = 0; i < p.length; ++i)
+                    if (p.active[(size_t) i])
+                    {
+                        const auto& e = p.events[(size_t) i];
+                        st.gate += e.gateSteps; st.rev += e.reverse; st.ratchet += e.ratchet > 1; st.layers += ! e.layers.empty(); ++n;
+                    }
+                st.hits += p.numEvents();
+            }
+            st.hits /= 200; st.gate /= n; st.rev /= n; st.ratchet /= n; st.layers /= n;
+            return st;
+        };
+        auto eth = stats (GenMode::Ethereal), hau = stats (GenMode::Haunted), nos = stats (GenMode::Nostalgia),
+             hev = stats (GenMode::Heaven), cha = stats (GenMode::Chaos);
+        logMessage ("hits  E " + juce::String (eth.hits, 1) + " H " + juce::String (hau.hits, 1) + " N " + juce::String (nos.hits, 1)
+                    + " Hv " + juce::String (hev.hits, 1) + " X " + juce::String (cha.hits, 1));
+        expectGreaterThan (cha.hits, eth.hits * 1.5);            // chaos is busy
+        expectGreaterThan (nos.hits, hev.hits);                  // boom-bap pocket vs sustained
+        expectGreaterThan (hev.gate, nos.gate * 2.0);            // heaven holds notes
+        expectGreaterThan (hau.rev, 0.3);                        // haunted reverses a lot
+        expectLessThan (hev.rev, 0.12);
+        expectGreaterThan (cha.ratchet, 0.15);                   // chaos stutters
+        expectGreaterThan (hev.layers, 0.6);                     // heaven stacks harmonies
+        expectGreaterThan (cha.hits * 0 + 1.0, 0.0);
+
+        beginTest ("density raises hit count");
+        double lo = 0, hi = 0;
+        for (uint32_t seed = 1; seed <= 100; ++seed)
+        {
+            GenSettings s; s.seed = seed; s.mode = GenMode::Nostalgia;
+            s.density = 0.1f; lo += PatternGenerator::generate (s, testSlots(), 120).numEvents();
+            s.density = 0.9f; hi += PatternGenerator::generate (s, testSlots(), 120).numEvents();
+        }
+        expectGreaterThan (hi, lo * 1.4);
+
+        beginTest ("pattern serialisation round trip");
+        GenSettings s; s.mode = GenMode::Heaven; s.steps = 32; s.seed = 4242;
+        auto p = PatternGenerator::generate (s, testSlots(), 100.0);
+        auto back = Pattern::fromTree (p.toTree());
+        expect (back.toTree().isEquivalentTo (p.toTree()));
+    }
+};
+
+struct ChopRendererTests : juce::UnitTest
+{
+    ChopRendererTests() : juce::UnitTest ("ChopRenderer", "GHOSTCUT") {}
+    void runTest() override
+    {
+        auto src = makeVoice (44100, 1.2, 220, 220, 0, 0, 0.0);
+        const int64_t s = (int64_t) (0.3 * 44100), e = s + (int64_t) (1.2 * 44100);
+
+        beginTest ("pitch shift +7 semitones lands on E4");
+        ChopRenderer::Request r;
+        r.start = s; r.end = e; r.semitones = 7.0f;
+        auto up = ChopRenderer::render (*src, r);
+        const float hz = medianPitch (up, 44100);
+        expectWithinAbsoluteError (12.0f * std::log2 (hz / 220.0f), 7.0f, 0.3f);
+        expectEquals (up.getNumSamples(), (int) (e - s));
+
+        beginTest ("time stretch hits the requested length, keeps pitch");
+        r.semitones = 0.0f; r.stretch = 2.0f;
+        auto slow = ChopRenderer::render (*src, r);
+        expectWithinAbsoluteError (slow.getNumSamples(), (int) (2 * (e - s)), 2);
+        expectWithinAbsoluteError (12.0f * std::log2 (medianPitch (slow, 44100) / 220.0f), 0.0f, 0.3f);
+        r.stretch = 1.0f; r.fixedOutputLength = 11025;
+        expectEquals (ChopRenderer::render (*src, r).getNumSamples(), 11025);
+
+        beginTest ("formants: preserved on pitch shift, movable on request");
+        auto centroid = [] (const juce::AudioBuffer<float>& b)
+        {
+            auto sn = std::make_shared<SourceSnapshot>(); sn->sampleRate = 44100; sn->audio = b;
+            auto f = PhraseSegmenter::computeFrames (*sn);
+            double c = 0; int n = 0;
+            for (size_t i = 0; i < f.db.size(); ++i) if (f.db[i] > -40) { c += f.centroid[i]; ++n; }
+            return n ? c / n : 0.0;
+        };
+        // a "vowel": buzzy source through a fixed resonance around 1 kHz
+        auto vowel = std::make_shared<SourceSnapshot>();
+        vowel->sampleRate = 44100;
+        vowel->audio.setSize (1, 44100 * 2);
+        {
+            juce::dsp::IIR::Filter<float> f1, f2;
+            f1.coefficients = juce::dsp::IIR::Coefficients<float>::makeBandPass (44100, 900, 4.0f);
+            f2.coefficients = juce::dsp::IIR::Coefficients<float>::makeBandPass (44100, 2400, 5.0f);
+            double ph = 0;
+            for (int i = 0; i < vowel->audio.getNumSamples(); ++i)
+            {
+                ph += 150.0 / 44100.0; ph -= std::floor (ph);
+                const float saw = (float) (2.0 * ph - 1.0);
+                vowel->audio.setSample (0, i, 0.4f * (f1.processSample (saw) + 0.6f * f2.processSample (saw)));
+            }
+        }
+        ChopRenderer::Request v; v.start = 2000; v.end = vowel->numSamples() - 2000; v.semitones = 12.0f;
+        const double base = centroid (vowel->audio);
+        v.preserveFormants = true;  const double kept = centroid (ChopRenderer::render (*vowel, v));
+        v.preserveFormants = false; const double moved = centroid (ChopRenderer::render (*vowel, v));
+        logMessage ("centroid base " + juce::String (base, 0) + "  +12st preserved " + juce::String (kept, 0) + "  not preserved " + juce::String (moved, 0));
+        expectLessThan (std::abs (kept - base), std::abs (moved - base));
+
+        beginTest ("reverse, sub-range and fades");
+        ChopRenderer::Request rv; rv.start = s; rv.end = e; rv.reverse = true; rv.startFrac = 0.25f; rv.endFrac = 0.75f; rv.fadeInMs = 20; rv.fadeOutMs = 20;
+        auto rb = ChopRenderer::render (*src, rv);
+        expectWithinAbsoluteError (rb.getNumSamples(), (int) ((e - s) / 2), 2);
+        expectEquals (rb.getSample (0, 0), 0.0f);
+        expectLessThan (std::abs (rb.getSample (0, rb.getNumSamples() - 1)), 1.0e-3f);
+    }
+};
+
+struct SequencerTests : juce::UnitTest
+{
+    SequencerTests() : juce::UnitTest ("Sequencer", "GHOSTCUT") {}
+
+    static std::shared_ptr<RenderedPattern> clickPattern (std::initializer_list<int> steps, float swing = 0.0f, int ratchetOn = -1,
+                                                          bool choke = false, int clipLen = 4800)
+    {
+        auto rp = std::make_shared<RenderedPattern>();
+        rp->sampleRate = 48000;
+        rp->pattern.length = 16; rp->pattern.stepDiv = 4; rp->pattern.swing = swing;
+        rp->pattern.slotUids = { 1 }; rp->pattern.slotRoots = { 60 };
+        juce::AudioBuffer<float> click (1, clipLen);
+        for (int i = 0; i < clipLen; ++i) click.setSample (0, i, 0.5f);
+        rp->clips.push_back (click);
+        for (int st : steps)
+        {
+            rp->pattern.active[(size_t) st] = true;
+            rp->pattern.events[(size_t) st].velocity = 1.0f;
+            rp->pattern.events[(size_t) st].gateSteps = 1.0f;
+            rp->pattern.events[(size_t) st].choke = choke;
+            rp->pattern.events[(size_t) st].ratchet = st == ratchetOn ? 4 : 1;
+            rp->hits[(size_t) st].push_back ({ 0, 1.0f });
+        }
+        return rp;
+    }
+
+    /** Renders `seconds` with the host transport playing from ppq 0 at 120 bpm. */
+    static juce::AudioBuffer<float> run (SamplerEngine& eng, double seconds, double hostRate = 48000, double startPpq = 0.0)
+    {
+        const int block = 512, total = (int) (seconds * hostRate);
+        juce::AudioBuffer<float> all (2, total), buf (2, block);
+        SamplerEngine::Params p;
+        double ppq = startPpq;
+        for (int pos = 0; pos < total; pos += block)
+        {
+            HostTransport h; h.valid = h.playing = h.hasPpq = true; h.bpm = 120.0; h.ppq = ppq;
+            eng.process (buf, {}, p, h);
+            for (int c = 0; c < 2; ++c) all.copyFrom (c, pos, buf, c, 0, std::min (block, total - pos));
+            ppq += block * 120.0 / 60.0 / hostRate;
+        }
+        return all;
+    }
+
+    void runTest() override
+    {
+        beginTest ("steps fire sample-accurately with the host");
+        {
+            SamplerEngine eng; eng.prepare (48000, 512);
+            eng.publishPattern (clickPattern ({ 0, 4 }));
+            auto out = run (eng, 1.2);
+            const int first = onsetSample (out, 0);
+            const int second = onsetSample (out, 12000);
+            expectEquals (first, 0);
+            expectEquals (second, 24000); // step 4 = 1 beat = 0.5 s @ 120 bpm
+        }
+
+        beginTest ("swing delays odd steps");
+        {
+            SamplerEngine eng; eng.prepare (48000, 512);
+            eng.publishPattern (clickPattern ({ 1 }, 0.5f));
+            auto out = run (eng, 0.5);
+            // step 1 at 1/16 = 6000 samples, plus half a step of swing = 3000
+            expectWithinAbsoluteError (onsetSample (out, 0), 9000, 1);
+        }
+
+        beginTest ("ratchets repeat inside the step, gates release");
+        {
+            SamplerEngine eng; eng.prepare (48000, 512);
+            eng.publishPattern (clickPattern ({ 0 }, 0.0f, 0, false, 600));
+            auto out = run (eng, 0.2);
+            // 4 hits in 6000 samples, each gated to 1500 samples (+10 ms release)
+            int onsets = 0; bool prevOn = false;
+            for (int i = 0; i < 6000; ++i)
+            {
+                const bool on = std::abs (out.getSample (0, i)) > 0.4f;
+                if (on && ! prevOn) ++onsets;
+                prevOn = on;
+            }
+            expectEquals (onsets, 4);
+        }
+
+        beginTest ("host stop releases pattern voices; loop jump resyncs");
+        {
+            SamplerEngine eng; eng.prepare (48000, 512);
+            eng.publishPattern (clickPattern ({ 0 }));
+            run (eng, 0.05);
+            expectGreaterThan (eng.getActiveVoiceCount(), 0);
+            juce::AudioBuffer<float> buf (2, 512);
+            HostTransport stopped; stopped.valid = true; stopped.playing = false; stopped.bpm = 120;
+            for (int i = 0; i < 20; ++i) eng.process (buf, {}, {}, stopped);
+            expectEquals (eng.getActiveVoiceCount(), 0);
+            auto again = run (eng, 0.05, 48000, 0.0); // restart at bar start: step 0 fires again
+            expectEquals (onsetSample (again, 0), 0);
+        }
+
+        beginTest ("pattern swap mid-note does not crash and frees the old one");
+        {
+            SamplerEngine eng; eng.prepare (48000, 512);
+            auto p1 = clickPattern ({ 0, 2, 4, 6, 8, 10, 12, 14 });
+            std::weak_ptr<RenderedPattern> w1 = p1;
+            eng.publishPattern (std::move (p1));
+            run (eng, 0.1);
+            eng.publishPattern (clickPattern ({ 1, 3 }));
+            run (eng, 0.5);
+            eng.collectGarbage();
+            expect (w1.expired(), "old pattern freed after its voices ended");
+        }
+    }
+};
+
+struct ExportPatternTests : juce::UnitTest
+{
+    ExportPatternTests() : juce::UnitTest ("PatternExport", "GHOSTCUT") {}
+    void runTest() override
+    {
+        beginTest ("loop length and MIDI content");
+        auto rp = SequencerTests::clickPattern ({ 0, 4, 8 });
+        rp->pattern.events[4].layers.push_back ({ 12, 0.5f, 0.0f });
+        auto loop = PatternExport::renderLoop (*rp, 120.0, 2, true);
+        expectEquals (loop.getNumSamples(), 48000 * 4); // 2 bars of 2 s
+        expectEquals (onsetSample (loop, 0), 0);
+        auto mf = PatternExport::toMidi (rp->pattern, 120.0);
+        int notes = 0;
+        for (auto* ev : *mf.getTrack (0)) if (ev->message.isNoteOn()) ++notes;
+        expectEquals (notes, 4); // 3 hits + 1 layer
+        expectEquals ((int) mf.getTimeFormat(), 960);
+    }
+};
+
+struct GenerationSessionTests : juce::UnitTest
+{
+    GenerationSessionTests() : juce::UnitTest ("Session generation", "GHOSTCUT") {}
+    void runTest() override
+    {
+        auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ghostcut_gen_test");
+        dir.deleteRecursively(); dir.createDirectory();
+        auto wavFile = dir.getChildFile ("vox.wav");
+        auto src = makeTestSource (44100.0, 1);
+        expect (AudioExporter::writeRegion (*src, 0, src->numSamples(), wavFile, AudioExporter::BitDepth::Int24).isEmpty());
+
+        SamplerEngine engine;
+        juce::ValueTree saved;
+        juce::ValueTree patternBefore;
+
+        beginTest ("generate renders a playable pattern");
+        {
+            Session s (engine);
+            s.importFile (wavFile);
+            expect (waitUntil ([&] { return s.hasSource() && ! s.isBusy() && ! s.getFragments().empty(); }));
+            auto g = s.getGenSettings();
+            g.mode = GenMode::Haunted; g.seed = 1234;
+            s.setGenSettings (g);
+            s.togglePin (0); s.togglePin (2);
+            expectEquals (s.numPinned(), 2);
+            s.generate (false);
+            expect (s.hasPattern());
+            expectEquals ((int) s.getPattern().slotUids.size(), 2);
+            expect (waitUntil ([&] { return ! s.isRenderingPattern(); }));
+
+            beginTest ("exports");
+            juce::String err;
+            auto wav = s.renderLoopForDrag (err);
+            expect (wav.existsAsFile(), err);
+            auto mid = s.renderMidiForDrag (err);
+            expect (mid.existsAsFile(), err);
+            wav.deleteFile(); mid.deleteFile();
+
+            beginTest ("pattern bank");
+            patternBefore = s.getPattern().toTree();
+            s.selectPatternSlot (3);
+            expect (! s.hasPattern());
+            s.selectPatternSlot (0);
+            expect (s.getPattern().toTree().isEquivalentTo (patternBefore));
+            saved = s.getStateTree();
+        }
+
+        beginTest ("recall restores pattern, seed and pins; regenerating with the seed reproduces it");
+        {
+            Session s (engine);
+            s.setStateTreeFromAnyThread (saved);
+            expect (waitUntil ([&] { return s.hasSource() && ! s.isBusy() && ! s.isRenderingPattern(); }));
+            expect (s.getPattern().toTree().isEquivalentTo (patternBefore));
+            expectEquals ((int) s.getGenSettings().seed, 1234);
+            expectEquals (s.numPinned(), 2);
+            s.generate (false);
+            expect (s.getPattern().toTree().isEquivalentTo (patternBefore), "same seed, same pattern");
+        }
+        engine.resetWhileAudioStopped();
+        dir.deleteRecursively();
+    }
+};
+
+static GeneratorTests generatorTests;
+static ChopRendererTests chopRendererTests;
+static SequencerTests sequencerTests;
+static ExportPatternTests exportPatternTests;
+static GenerationSessionTests generationSessionTests;
 
 static StftTests stftTests;
 static SeparationTests separationTests;

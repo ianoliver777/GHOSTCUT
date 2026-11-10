@@ -86,7 +86,8 @@ public:
         auto area = getLocalBounds().reduced (8, 0);
         g.setFont (GhostLookAndFeel::mono (11.0f));
         g.setColour (on ? colours::accent : colours::text);
-        g.drawText (juce::String (i + 1).paddedLeft ('0', 2) + (f.manual ? "*" : ""), area.removeFromLeft (30), juce::Justification::centredLeft);
+        g.drawText (juce::String (i + 1).paddedLeft ('0', 2) + (f.manual ? "*" : "") + (owner.session.isPinned (i) ? "^" : ""),
+                    area.removeFromLeft (30), juce::Justification::centredLeft);
 
         g.setColour (colours::textDim);
         g.drawText (owner.isSlices() ? noteName (owner.getBaseNote() + i) : "--", area.removeFromLeft (38), juce::Justification::centredLeft);
@@ -258,8 +259,10 @@ FragmentInspector::FragmentInspector (Session& s) : session (s)
 {
     dragHandle = std::make_unique<DragHandle> (session);
     addAndMakeVisible (*dragHandle);
-    for (auto* b : { &audition, &exportBtn, &del }) addAndMakeVisible (b);
+    for (auto* b : { &audition, &exportBtn, &del, &pin }) addAndMakeVisible (b);
     addAndMakeVisible (rootBox);
+    pin.setTooltip ("Pin this fragment for GENERATE (up to 8). With no pins, GENERATE picks the best ones for the mode.");
+    pin.onClick = [this] { session.togglePin (session.getSelectedIndex()); };
 
     rootBox.addItem ("ROOT: AUTO", 1);
     for (int n = 24; n <= 96; ++n) rootBox.addItem ("ROOT: " + noteName (n), n + 2);
@@ -289,8 +292,10 @@ void FragmentInspector::update()
     const int i = session.getSelectedIndex();
     const bool has = i >= 0 && i < (int) session.getFragments().size() && session.hasSource();
     for (juce::Component* c : { (juce::Component*) &audition, (juce::Component*) &exportBtn, (juce::Component*) &del,
-                                (juce::Component*) &rootBox, (juce::Component*) dragHandle.get() })
+                                (juce::Component*) &rootBox, (juce::Component*) dragHandle.get(), (juce::Component*) &pin })
         c->setEnabled (has);
+    pin.setToggleState (has && session.isPinned (i), juce::dontSendNotification);
+    pin.setButtonText (has && session.isPinned (i) ? "Pinned" : "Pin");
     if (has)
     {
         const int o = session.getFragments()[(size_t) i].rootOverride;
@@ -416,7 +421,10 @@ void FragmentInspector::resized()
     exportBtn.setBounds (bottom.removeFromLeft (w)); bottom.removeFromLeft (6);
     del.setBounds (bottom);
     r.removeFromBottom (6);
-    dragHandle->setBounds (r.removeFromBottom (28));
+    auto dragRow = r.removeFromBottom (28);
+    pin.setBounds (dragRow.removeFromRight (90));
+    dragRow.removeFromRight (6);
+    dragHandle->setBounds (dragRow);
     rootBox.setBounds (r.withTrimmedTop (14).removeFromTop (24).removeFromRight (std::min (120, r.getWidth() / 2)));
 }
 

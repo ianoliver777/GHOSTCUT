@@ -14,6 +14,9 @@ GhostcutProcessor::GhostcutProcessor()
     pTrigger  = apvts.getRawParameterValue (param::trigger);
     pBaseNote = apvts.getRawParameterValue (param::baseNote);
     pVelSens  = apvts.getRawParameterValue (param::velSens);
+    pSeqMode  = apvts.getRawParameterValue (param::seqMode);
+    pTempo    = apvts.getRawParameterValue (param::tempo);
+    pPatLevel = apvts.getRawParameterValue (param::patLevel);
 
     startTimerHz (10); // frees objects the audio thread has retired
 }
@@ -46,6 +49,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout GhostcutProcessor::createLay
                                                     [] (int v, int) { return ghostcut::noteName (v); })));
     l.add (std::make_unique<AudioParameterFloat> (ParameterID { param::velSens, 1 }, "Velocity",
                                                   NormalisableRange<float> (0.0f, 1.0f, 0.01f), 1.0f));
+    l.add (std::make_unique<AudioParameterChoice> (ParameterID { param::seqMode, 1 }, "Pattern Sync",
+                                                   StringArray { "Off", "Host transport" }, 1));
+    l.add (std::make_unique<AudioParameterFloat> (ParameterID { param::tempo, 1 }, "Tempo (no host)",
+                                                  NormalisableRange<float> (40.0f, 240.0f, 0.1f), 120.0f,
+                                                  AudioParameterFloatAttributes().withLabel ("bpm")));
+    l.add (std::make_unique<AudioParameterFloat> (ParameterID { param::patLevel, 1 }, "Pattern Level",
+                                                  NormalisableRange<float> (-36.0f, 6.0f, 0.1f), 0.0f,
+                                                  AudioParameterFloatAttributes().withLabel ("dB")));
     return l;
 }
 
@@ -74,8 +85,21 @@ void GhostcutProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mi
     p.trigger      = pTrigger->load() > 0.5f ? SamplerEngine::TriggerMode::Gate : SamplerEngine::TriggerMode::OneShot;
     p.baseNote     = (int) pBaseNote->load();
     p.velocitySens = pVelSens->load();
+    p.seqMode      = pSeqMode->load() > 0.5f ? SamplerEngine::SeqMode::HostSync : SamplerEngine::SeqMode::Off;
+    p.fallbackBpm  = pTempo->load();
+    p.patternGain  = juce::Decibels::decibelsToGain (pPatLevel->load(), -36.0f);
 
-    engine.process (buffer, midi, p);
+    HostTransport host;
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition())
+        {
+            host.valid = true;
+            host.playing = pos->getIsPlaying();
+            if (auto ppq = pos->getPpqPosition()) { host.ppq = *ppq; host.hasPpq = true; }
+            if (auto bpm = pos->getBpm()) host.bpm = *bpm;
+        }
+
+    engine.process (buffer, midi, p, host);
 }
 
 juce::AudioProcessorEditor* GhostcutProcessor::createEditor()

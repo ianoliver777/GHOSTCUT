@@ -46,6 +46,9 @@ namespace
 {
     const OrtApi* ortApi (const void* p) { return static_cast<const OrtApi*> (p); }
 
+    /** Releases a status we don't need to inspect (prevents leaks + warnings). */
+    void ignoreStatus (const OrtApi* api, OrtStatus* s) { if (s != nullptr) api->ReleaseStatus (s); }
+
     juce::String takeError (const OrtApi* api, OrtStatus* s)
     {
         if (s == nullptr) return {};
@@ -72,9 +75,9 @@ namespace
             juce::String e;
             if ((e = takeError (api, api->CreateEnv (ORT_LOGGING_LEVEL_WARNING, "GHOSTCUT", &env))).isNotEmpty()) return e;
             if ((e = takeError (api, api->CreateSessionOptions (&options))).isNotEmpty()) return e;
-            api->SetIntraOpNumThreads (options, std::max (1, threads));
-            api->SetInterOpNumThreads (options, 1);
-            api->SetSessionGraphOptimizationLevel (options, ORT_ENABLE_ALL);
+            ignoreStatus (api, api->SetIntraOpNumThreads (options, std::max (1, threads)));
+            ignoreStatus (api, api->SetInterOpNumThreads (options, 1));
+            ignoreStatus (api, api->SetSessionGraphOptimizationLevel (options, ORT_ENABLE_ALL));
 
            #if JUCE_WINDOWS
             const auto path = file.getFullPathName();
@@ -85,28 +88,28 @@ namespace
             if (e.isNotEmpty()) return e;
 
             OrtAllocator* alloc = nullptr;
-            api->GetAllocatorWithDefaultOptions (&alloc);
+            ignoreStatus (api, api->GetAllocatorWithDefaultOptions (&alloc));
             size_t nIn = 0, nOut = 0;
-            api->SessionGetInputCount (session, &nIn);
-            api->SessionGetOutputCount (session, &nOut);
+            ignoreStatus (api, api->SessionGetInputCount (session, &nIn));
+            ignoreStatus (api, api->SessionGetOutputCount (session, &nOut));
             if (nIn != 1 || nOut < 1) return "Model must have exactly one input and at least one output.";
 
             char* name = nullptr;
             if ((e = takeError (api, api->SessionGetInputName (session, 0, alloc, &name))).isNotEmpty()) return e;
-            inName = name; api->AllocatorFree (alloc, name);
+            inName = name; ignoreStatus (api, api->AllocatorFree (alloc, name));
             if ((e = takeError (api, api->SessionGetOutputName (session, 0, alloc, &name))).isNotEmpty()) return e;
-            outName = name; api->AllocatorFree (alloc, name);
+            outName = name; ignoreStatus (api, api->AllocatorFree (alloc, name));
 
             OrtTypeInfo* ti = nullptr;
             if ((e = takeError (api, api->SessionGetInputTypeInfo (session, 0, &ti))).isNotEmpty()) return e;
             const OrtTensorTypeAndShapeInfo* tsi = nullptr;
-            api->CastTypeInfoToTensorInfo (ti, &tsi);
+            ignoreStatus (api, api->CastTypeInfoToTensorInfo (ti, &tsi));
             size_t dims = 0;
-            api->GetDimensionsCount (tsi, &dims);
+            ignoreStatus (api, api->GetDimensionsCount (tsi, &dims));
             shape.resize (dims);
-            api->GetDimensions (tsi, shape.data(), dims);
+            ignoreStatus (api, api->GetDimensions (tsi, shape.data(), dims));
             ONNXTensorElementDataType type {};
-            api->GetTensorElementType (tsi, &type);
+            ignoreStatus (api, api->GetTensorElementType (tsi, &type));
             api->ReleaseTypeInfo (ti);
             if (type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return "Model input must be float32.";
             if (! shape.empty() && shape[0] <= 0) shape[0] = 1; // dynamic batch -> 1
@@ -135,9 +138,9 @@ namespace
             if (err.isNotEmpty()) return false;
 
             OrtTensorTypeAndShapeInfo* oi = nullptr;
-            api->GetTensorTypeAndShape (out, &oi);
+            ignoreStatus (api, api->GetTensorTypeAndShape (out, &oi));
             size_t outCount = 0;
-            api->GetTensorShapeElementCount (oi, &outCount);
+            ignoreStatus (api, api->GetTensorShapeElementCount (oi, &outCount));
             api->ReleaseTensorTypeAndShapeInfo (oi);
 
             float* data = nullptr;

@@ -76,14 +76,14 @@ public:
 
         if (next == nullptr && clearRequested.exchange (false, std::memory_order_acq_rel))
         {
-            if (current != nullptr) { retire (current); current = nullptr; changed = true; }
+            if (current != nullptr) { retireInternal (current); current = nullptr; changed = true; }
             return current;
         }
 
         if (next != nullptr)
         {
             clearRequested.store (false, std::memory_order_release);
-            if (current != nullptr) retire (current);
+            if (current != nullptr) retireInternal (current);
             current = next;
             changed = true;
         }
@@ -92,17 +92,41 @@ public:
 
     const T* getCurrentOnAudioThread() const noexcept { return current; }
 
-private:
+    /** Like acquire(), but does NOT retire the previous object: it is handed back in
+        `previous` and the audio thread must call retire() once nothing uses it. */
+    const T* acquireKeepPrevious (bool& changed, const T*& previous) noexcept
+    {
+        changed = false;
+        previous = nullptr;
+        const T* next = pending.exchange (nullptr, std::memory_order_acq_rel);
+        if (next == nullptr && clearRequested.exchange (false, std::memory_order_acq_rel))
+        {
+            previous = current; current = nullptr; changed = previous != nullptr;
+            return current;
+        }
+        if (next != nullptr)
+        {
+            clearRequested.store (false, std::memory_order_release);
+            previous = current;
+            current = next;
+            changed = true;
+        }
+        return current;
+    }
+
+    /** Audio thread: hands an object back for freeing on the message thread. */
     void retire (const T* p) noexcept
     {
+        if (p == nullptr) return;
         int start1, size1, start2, size2;
         retireFifo.prepareToWrite (1, start1, size1, start2, size2);
         if (size1 > 0)       retired[(size_t) start1] = p;
         else if (size2 > 0)  retired[(size_t) start2] = p;
-        // If the FIFO is full the message thread is stalled; the object stays in
-        // `held` and is freed at shutdown. Leaking briefly beats freeing here.
         retireFifo.finishedWrite (size1 + size2 > 0 ? 1 : 0);
     }
+
+private:
+    void retireInternal (const T* p) noexcept { retire (p); }
 
     void release (const T* p)
     {

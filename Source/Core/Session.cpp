@@ -16,6 +16,7 @@ namespace ids
     static const juce::Identifier sensitivity { "sensitivity" }, exportBits { "exportBits" }, version { "version" };
     static const juce::Identifier view { "view" }, granularity { "granularity" }, sort { "sort" }, search { "search" };
     static const juce::Identifier vocalsMethod { "vocalsMethod" }, sepMethod { "sepMethod" }, sepModel { "sepModel" };
+    static const juce::Identifier patterns { "PATTERNS" }, patternSlot { "slot" }, pinned { "pinned" };
 }
 
 static VocalSeparator::Options defaultSeparationOptions()
@@ -31,10 +32,12 @@ static VocalSeparator::Options defaultSeparationOptions()
 Session::Session (SamplerEngine& e) : engine (e), sepOptions (defaultSeparationOptions())
 {
     updateStateCache();
+    startTimerHz (2); // tempo watch for fit-to-gate patterns
 }
 
 Session::~Session()
 {
+    stopTimer();
     alive->store (false);
     generation.fetch_add (1);                 // makes running jobs bail out
     worker.removeAllJobs (true, 10000);
@@ -80,22 +83,22 @@ void Session::startLoad (const juce::File& f, int64_t trimStart, int64_t trimEnd
         return;
     }
 
-    const int gen = generation.fetch_add (1) + 1;
+    const int jobGen = generation.fetch_add (1) + 1;
     busy = true;
     progress = 0.0f;
     engine.sendCommand ({ EngineCommand::Type::StopAll });
     setStatus ("Loading " + f.getFileName() + "...");
 
     auto aliveFlag = alive;
-    runJob ("load", [this, aliveFlag, gen, f, trimStart, trimEnd, autoAnalyze,
+    runJob ("load", [this, aliveFlag, jobGen, f, trimStart, trimEnd, autoAnalyze,
                      keep = std::move (keepFragments), expectedHash]() mutable
     {
-        auto keepGoing = [this, aliveFlag, gen] { return aliveFlag->load() && generation.load() == gen; };
+        auto keepGoing = [this, aliveFlag, jobGen] { return aliveFlag->load() && generation.load() == jobGen; };
         auto result = importer.load (f, trimStart, trimEnd, [this] (float p) { progress = p; }, keepGoing);
 
-        juce::MessageManager::callAsync ([this, aliveFlag, gen, result, autoAnalyze, keep = std::move (keep), expectedHash]() mutable
+        juce::MessageManager::callAsync ([this, aliveFlag, jobGen, result, autoAnalyze, keep = std::move (keep), expectedHash]() mutable
         {
-            if (! aliveFlag->load() || generation.load() != gen) return;
+            if (! aliveFlag->load() || generation.load() != jobGen) return;
             busy = false;
 
             if (result.snapshot == nullptr)
@@ -168,21 +171,21 @@ void Session::analyze()
 void Session::startFrameAnalysis (bool segmentAfter)
 {
     if (snapshot == nullptr) return;
-    const int gen = generation.load();
+    const int jobGen = generation.load();
     busy = true;
     progress = 0.0f;
     setStatus (segmentAfter ? "Analyzing phrases..." : "Measuring audio...");
 
     auto snap = analysisSnapshot();
     auto aliveFlag = alive;
-    runJob ("frames", [this, aliveFlag, gen, snap, segmentAfter]
+    runJob ("frames", [this, aliveFlag, jobGen, snap, segmentAfter]
     {
-        auto keepGoing = [this, aliveFlag, gen] { return aliveFlag->load() && generation.load() == gen; };
+        auto keepGoing = [this, aliveFlag, jobGen] { return aliveFlag->load() && generation.load() == jobGen; };
         auto ff = std::make_shared<FrameFeatures> (PhraseSegmenter::computeFrames (*snap, [this] (float p) { progress = p; }, keepGoing));
 
-        juce::MessageManager::callAsync ([this, aliveFlag, gen, ff, segmentAfter]
+        juce::MessageManager::callAsync ([this, aliveFlag, jobGen, ff, segmentAfter]
         {
-            if (! aliveFlag->load() || generation.load() != gen) return;
+            if (! aliveFlag->load() || generation.load() != jobGen) return;
             busy = false;
             if (ff->numFrames() == 0) { setStatus ("Analysis cancelled", true); return; }
             frames = ff;
@@ -192,6 +195,7 @@ void Session::startFrameAnalysis (bool segmentAfter)
 
             if (segmentAfter) analyze();
             else { publishTable(); updateStateCache(); setStatus (snapshot->displayName + " ready"); }
+            if (hasPattern()) renderPatternAsync();
             sendChangeMessage();
         });
     });
@@ -309,6 +313,7 @@ void Session::sortAndPublish (int64_t keepSelectedUid)
     publishTable();
     updateStateCache();
     sendChangeMessage();
+    if (hasPattern() && ! busy) renderPatternAsync();
 }
 
 void Session::publishTable()
@@ -399,6 +404,17 @@ void Session::updateStateCache()
     t.setProperty (ids::vocalsMethod, vocals != nullptr ? vocalsMethodId : pendingVocalsMethod, nullptr);
     t.setProperty (ids::sepMethod, (int) sepOptions.method, nullptr);
     t.setProperty (ids::sepModel, sepOptions.model.file.getFileName(), nullptr);
+    {
+        juce::StringArray pins;
+        for (auto u : pinned) pins.add (juce::String (u));
+        t.setProperty (ids::pinned, pins.joinIntoString (","), nullptr);
+        t.appendChild (gen.toTree(), nullptr);
+        juce::ValueTree pats (ids::patterns);
+        pats.setProperty (ids::patternSlot, patternSlot, nullptr);
+        for (int i = 0; i < numPatternSlots; ++i)
+            pats.appendChild (i == patternSlot ? pattern.toTree() : bank[(size_t) i].toTree(), nullptr);
+        t.appendChild (pats, nullptr);
+    }
 
     juce::ValueTree src (ids::source);
     if (snapshot != nullptr)
@@ -486,6 +502,23 @@ void Session::restoreOnMessageThread (const juce::ValueTree& t)
     search = SearchQuery::parse (searchText);
     pendingVocalsMethod = t.getProperty (ids::vocalsMethod).toString();
     {
+        pinned.clear();
+        juce::StringArray pins;
+        pins.addTokens (t.getProperty (ids::pinned).toString(), ",", "");
+        pins.removeEmptyStrings();
+        for (auto& pi : pins) pinned.push_back (pi.getLargeIntValue());
+        gen = GenSettings::fromTree (t.getChildWithName ("GEN"));
+        const auto pats = t.getChildWithName (ids::patterns);
+        for (auto& b : bank) b = Pattern();
+        int i = 0;
+        for (auto pt : pats) if (i < numPatternSlots) bank[(size_t) i++] = Pattern::fromTree (pt);
+        patternSlot = juce::jlimit (0, numPatternSlots - 1, (int) pats.getProperty (ids::patternSlot, 0));
+        pattern = bank[(size_t) patternSlot];
+        rendered.reset();
+        patternGeneration.fetch_add (1);
+        engine.publishPattern (nullptr);
+    }
+    {
         const auto m = (VocalSeparator::Method) (int) t.getProperty (ids::sepMethod, (int) sepOptions.method);
         const auto modelName = t.getProperty (ids::sepModel).toString();
         if (m == VocalSeparator::Method::MdxModel)
@@ -567,6 +600,7 @@ void Session::setView (View v)
     if (v == View::Vocals && vocals == nullptr) return;
     view = v;
     publishPlayback();
+    if (hasPattern()) renderPatternAsync(); // chops come from what you hear
     updateStateCache();
     sendChangeMessage();
 }
@@ -584,21 +618,21 @@ void Session::startSeparation (bool restoring)
     auto opts = sepOptions;
     if (opts.method == VocalSeparator::Method::None) { startFrameAnalysis (! restoring); return; }
 
-    const int gen = generation.load();
+    const int jobGen = generation.load();
     busy = true;
     progress = 0.0f;
     setStatus ("Separating vocals: " + VocalSeparator::methodLabel (opts) + "...");
 
     auto src = snapshot;
     auto aliveFlag = alive;
-    runJob ("separate", [this, aliveFlag, gen, src, opts, restoring]
+    runJob ("separate", [this, aliveFlag, jobGen, src, opts, restoring]
     {
-        auto keepGoing = [this, aliveFlag, gen] { return aliveFlag->load() && generation.load() == gen; };
+        auto keepGoing = [this, aliveFlag, jobGen] { return aliveFlag->load() && generation.load() == jobGen; };
         auto result = VocalSeparator::separate (*src, opts, [this] (float p) { progress = p; }, keepGoing);
 
-        juce::MessageManager::callAsync ([this, aliveFlag, gen, result, opts, restoring]
+        juce::MessageManager::callAsync ([this, aliveFlag, jobGen, result, opts, restoring]
         {
-            if (! aliveFlag->load() || generation.load() != gen) return;
+            if (! aliveFlag->load() || generation.load() != jobGen) return;
             busy = false;
             if (result.vocals == nullptr)
             {
@@ -644,12 +678,9 @@ float Session::sortValue (int index) const
 {
     if (index < 0 || index >= (int) fragments.size()) return 0.0f;
     const auto& f = fragments[(size_t) index];
-    switch (sort)
-    {
-        case Sort::Time:   return 0.0f;
-        case Sort::Match:  return search.match (f);
-        default:           return f.scores[(int) sort - 1];
-    }
+    if (sort == Sort::Time)  return 0.0f;
+    if (sort == Sort::Match) return search.match (f);
+    return f.scores[(int) sort - 1];
 }
 
 std::vector<int> Session::getDisplayOrder() const
@@ -659,6 +690,184 @@ std::vector<int> Session::getDisplayOrder() const
     if (sort != Sort::Time)
         std::stable_sort (order.begin(), order.end(), [this] (int a, int b) { return sortValue (a) > sortValue (b); });
     return order;
+}
+
+//==============================================================================
+// Generation
+//==============================================================================
+std::vector<GenSlot> Session::currentGenSlots() const
+{
+    if (! pinned.empty())
+    {
+        std::vector<GenSlot> out;
+        for (auto uid : pinned)
+            for (auto& f : fragments)
+                if (f.uid == uid)
+                    out.push_back ({ f.uid, f.effectiveRoot (60), f.features.durationSec, PatternGenerator::modeScore (f, gen.mode) });
+        if (! out.empty()) return out;
+    }
+    return PatternGenerator::pickSlots (fragments, gen.mode, 6);
+}
+
+void Session::generate (bool newSeed)
+{
+    if (snapshot == nullptr || fragments.empty()) { setStatus ("Discover some fragments first", true); return; }
+    if (newSeed)
+    {
+        // fresh seed from the clock, but only 6 digits so it's easy to note down
+        gen.seed = (uint32_t) (juce::Time::getHighResolutionTicks() % 1000000);
+    }
+    pattern = PatternGenerator::generate (gen, currentGenSlots(), getBpm());
+    bank[(size_t) patternSlot] = pattern;
+    updateStateCache();
+    setStatus (juce::String (genModeName (gen.mode)) + " pattern, seed " + juce::String ((int) gen.seed)
+               + ", " + juce::String (pattern.numEvents()) + " hits");
+    renderPatternAsync();
+}
+
+void Session::setPattern (const Pattern& p)
+{
+    pattern = p;
+    bank[(size_t) patternSlot] = pattern;
+    updateStateCache();
+    sendChangeMessage();
+    renderPatternAsync();
+}
+
+void Session::selectPatternSlot (int slot)
+{
+    slot = juce::jlimit (0, numPatternSlots - 1, slot);
+    bank[(size_t) patternSlot] = pattern;
+    patternSlot = slot;
+    pattern = bank[(size_t) slot];
+    updateStateCache();
+    sendChangeMessage();
+    if (hasPattern()) renderPatternAsync();
+    else { rendered.reset(); engine.publishPattern (nullptr); }
+}
+
+void Session::togglePin (int index)
+{
+    if (index < 0 || index >= (int) fragments.size()) return;
+    const auto uid = fragments[(size_t) index].uid;
+    auto it = std::find (pinned.begin(), pinned.end(), uid);
+    if (it != pinned.end()) pinned.erase (it);
+    else if (pinned.size() < 8) pinned.push_back (uid);
+    updateStateCache();
+    sendChangeMessage();
+}
+
+bool Session::isPinned (int index) const
+{
+    if (index < 0 || index >= (int) fragments.size()) return false;
+    return std::find (pinned.begin(), pinned.end(), fragments[(size_t) index].uid) != pinned.end();
+}
+
+int Session::fragmentIndexForSlot (int slot) const
+{
+    if (slot < 0 || slot >= (int) pattern.slotUids.size()) return -1;
+    for (int i = 0; i < (int) fragments.size(); ++i)
+        if (fragments[(size_t) i].uid == pattern.slotUids[(size_t) slot]) return i;
+    return -1;
+}
+
+void Session::setPatternPlaying (bool run)
+{
+    engine.sendCommand ({ run ? EngineCommand::Type::SeqStart : EngineCommand::Type::SeqStop });
+}
+
+void Session::renderPatternAsync()
+{
+    auto snap = getSnapshot();
+    if (snap == nullptr || ! hasPattern()) return;
+
+    std::vector<std::pair<int64_t, int64_t>> bounds;
+    for (auto uid : pattern.slotUids)
+    {
+        std::pair<int64_t, int64_t> b { 0, 0 };
+        for (auto& f : fragments) if (f.uid == uid) b = { f.start, f.end };
+        bounds.push_back (b);
+    }
+
+    const int pgen = patternGeneration.fetch_add (1) + 1;
+    const double bpm = getBpm();
+    renderingPattern = true;
+    auto pat = pattern;
+    auto aliveFlag = alive;
+    runJob ("pattern", [this, aliveFlag, pgen, snap, pat, bounds, bpm]
+    {
+        auto keepGoing = [this, aliveFlag, pgen] { return aliveFlag->load() && patternGeneration.load() == pgen; };
+        auto rp = renderPattern (pat, *snap, bounds, bpm, keepGoing);
+        juce::MessageManager::callAsync ([this, aliveFlag, pgen, rp, bpm]
+        {
+            if (! aliveFlag->load() || patternGeneration.load() != pgen) return;
+            renderingPattern = false;
+            if (rp == nullptr) return;
+            rendered = rp;
+            renderedBpm = bpm;
+            engine.publishPattern (rp);
+            sendChangeMessage();
+        });
+    });
+    sendChangeMessage();
+}
+
+void Session::timerCallback()
+{
+    if (! hasPattern() || renderingPattern || rendered == nullptr) return;
+    bool needsTempo = false;
+    for (int i = 0; i < pattern.length; ++i)
+        if (pattern.active[(size_t) i] && pattern.events[(size_t) i].fitToGate) needsTempo = true;
+    if (needsTempo && std::abs (getBpm() - renderedBpm) > 0.5)
+        renderPatternAsync();
+}
+
+static juce::String writeWav (const juce::AudioBuffer<float>& audio, double sr, const juce::File& dest, AudioExporter::BitDepth depth)
+{
+    SourceSnapshot tmp;
+    tmp.audio = audio;
+    tmp.sampleRate = sr;
+    return AudioExporter::writeRegion (tmp, 0, audio.getNumSamples(), dest, depth);
+}
+
+juce::String Session::exportLoop (const juce::File& dest, int loops) const
+{
+    if (rendered == nullptr) return "Generate a pattern first.";
+    auto audio = PatternExport::renderLoop (*rendered, renderedBpm > 0 ? renderedBpm : getBpm(), loops, true);
+    return writeWav (audio, rendered->sampleRate, dest, exportDepth);
+}
+
+juce::String Session::exportMidi (const juce::File& dest) const
+{
+    if (! hasPattern()) return "Generate a pattern first.";
+    auto mf = PatternExport::toMidi (pattern, getBpm());
+    dest.deleteFile();
+    juce::FileOutputStream os (dest);
+    if (! os.openedOk()) return "Cannot write " + dest.getFullPathName();
+    return mf.writeTo (os, 1) ? juce::String() : juce::String ("MIDI write failed");
+}
+
+static juce::String patternFileStem (const GenSettings& g, double bpm)
+{
+    return "GHOSTCUT_" + juce::String (genModeName (g.mode)) + "_" + ScaleQuantizer::keyNames()[g.key]
+           + juce::String (g.scale == ScaleQuantizer::Scale::Major || g.scale == ScaleQuantizer::Scale::PentatonicMajor ? "maj" : "min")
+           + "_" + juce::String ((int) std::lround (bpm)) + "bpm_seed" + juce::String ((int) g.seed);
+}
+
+juce::File Session::renderLoopForDrag (juce::String& error) const
+{
+    auto f = AudioExporter::getDragExportFolder().getSiblingFile ("Loops").getChildFile (patternFileStem (pattern.madeWith, getBpm()) + ".wav");
+    f.getParentDirectory().createDirectory();
+    error = exportLoop (f, 1);
+    return error.isEmpty() ? f : juce::File();
+}
+
+juce::File Session::renderMidiForDrag (juce::String& error) const
+{
+    auto f = AudioExporter::getDragExportFolder().getSiblingFile ("MIDI").getChildFile (patternFileStem (pattern.madeWith, getBpm()) + ".mid");
+    f.getParentDirectory().createDirectory();
+    error = exportMidi (f);
+    return error.isEmpty() ? f : juce::File();
 }
 
 } // namespace ghostcut

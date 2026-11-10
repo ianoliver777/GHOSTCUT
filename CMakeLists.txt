@@ -112,7 +112,18 @@ set(GHOSTCUT_CORE_SOURCES
     Source/Analysis/OnnxRuntime.h
     Source/Analysis/OnnxRuntime.cpp
     Source/Analysis/VocalSeparator.h
-    Source/Analysis/VocalSeparator.cpp)
+    Source/Analysis/VocalSeparator.cpp
+    Source/Generation/Random.h
+    Source/Generation/ScaleQuantizer.h
+    Source/Generation/ScaleQuantizer.cpp
+    Source/Generation/Pattern.h
+    Source/Generation/Pattern.cpp
+    Source/Generation/PatternGenerator.h
+    Source/Generation/PatternGenerator.cpp
+    Source/Generation/ChopRenderer.h
+    Source/Generation/ChopRenderer.cpp
+    Source/Generation/PatternExport.h
+    Source/Generation/PatternExport.cpp)
 
 set(GHOSTCUT_UI_SOURCES
     Source/UI/GhostLookAndFeel.h
@@ -122,7 +133,13 @@ set(GHOSTCUT_UI_SOURCES
     Source/UI/FragmentBrowser.h
     Source/UI/FragmentBrowser.cpp
     Source/UI/DiscoverPanel.h
-    Source/UI/DiscoverPanel.cpp)
+    Source/UI/DiscoverPanel.cpp
+    Source/UI/PatternView.h
+    Source/UI/PatternView.cpp
+    Source/UI/GeneratePanel.h
+    Source/UI/GeneratePanel.cpp
+    Source/UI/SequencePanel.h
+    Source/UI/SequencePanel.cpp)
 
 set(GHOSTCUT_COMMON_DEFINITIONS
     JUCE_WEB_BROWSER=0
@@ -166,6 +183,15 @@ target_sources(GHOSTCUT PRIVATE
     ${GHOSTCUT_UI_SOURCES})
 
 target_compile_definitions(GHOSTCUT PUBLIC ${GHOSTCUT_COMMON_DEFINITIONS})
+target_include_directories(GHOSTCUT PRIVATE ThirdParty/signalsmith-linear/include)
+if(MSVC)
+    target_compile_options(GHOSTCUT PRIVATE /bigobj)   # Signalsmith template depth
+endif()
+if(APPLE)
+    # Signalsmith Linear uses Accelerate for its FFT on Apple platforms
+    target_compile_definitions(GHOSTCUT PRIVATE SIGNALSMITH_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
+    target_link_libraries(GHOSTCUT PRIVATE "-framework Accelerate")
+endif()
 if(GHOSTCUT_WITH_ONNX)
     target_include_directories(GHOSTCUT PRIVATE "${GHOSTCUT_ORT_DIR}/include")
 endif()
@@ -187,7 +213,14 @@ if(GHOSTCUT_BUILD_TESTS)
     target_sources(GhostcutTests PRIVATE Tests/TestMain.cpp ${GHOSTCUT_CORE_SOURCES})
     target_compile_definitions(GhostcutTests PRIVATE ${GHOSTCUT_COMMON_DEFINITIONS}
         JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_UNIT_TESTS=1)
-    target_include_directories(GhostcutTests PRIVATE Source)
+    target_include_directories(GhostcutTests PRIVATE Source ThirdParty/signalsmith-linear/include)
+    if(MSVC)
+        target_compile_options(GhostcutTests PRIVATE /bigobj)
+    endif()
+    if(APPLE)
+        target_compile_definitions(GhostcutTests PRIVATE SIGNALSMITH_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
+        target_link_libraries(GhostcutTests PRIVATE "-framework Accelerate")
+    endif()
     if(GHOSTCUT_WITH_ONNX)
         target_include_directories(GhostcutTests PRIVATE "${GHOSTCUT_ORT_DIR}/include")
     endif()

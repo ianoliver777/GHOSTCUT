@@ -3,6 +3,8 @@
 #include "PluginProcessor.h"
 #include "UI/GhostLookAndFeel.h"
 #include "UI/DiscoverPanel.h"
+#include "UI/GeneratePanel.h"
+#include "UI/SequencePanel.h"
 
 /** Simple honest panel for pages that are scheduled for a later phase. */
 class PlannedPanel : public juce::Component
@@ -68,7 +70,9 @@ private:
 
     juce::OwnedArray<juce::TextButton> tabs;
     ghostcut::DiscoverPanel discover;
-    PlannedPanel generate, sequence, effects;
+    ghostcut::GeneratePanel generate;
+    ghostcut::SequencePanel sequence;
+    PlannedPanel effects;
     SettingsPanel settings;
     int currentTab = 0;
 
